@@ -1,0 +1,23 @@
+# Search index (SQLite + WAL sidecars) — created next to the scanned PDFs
+.pdf_search_index.db
+.pdf_search_index.db-wal
+.pdf_search_index.db-shm
+*.pdf_search_index.db*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments / local config
+.venv/
+venv/
+env/
+.env
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
