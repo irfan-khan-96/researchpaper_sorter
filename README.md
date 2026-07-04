@@ -16,6 +16,9 @@ so re‑opening a large library is near‑instant.
 
 - **Content search** across title / authors / year / abstract / keywords / full text
   with per‑field relevance weighting (BM25 when FTS5 is present).
+- **Whole‑document full‑text search** — the entire body of each paper is indexed,
+  so you can find a concept that appears anywhere (methods, results, discussion),
+  not just in the title or abstract.
 - **Incremental indexing** — files are skipped unless their size or modification
   time changed.
 - **Parallel extraction** — PDF text extraction is fanned out across CPU cores,
@@ -74,7 +77,8 @@ defaults — nothing is hard‑coded. Override any of these before launching:
 | `RPS_DB_FILENAME` | `.pdf_search_index.db` | Index filename (stored inside the scanned folder) |
 | `RPS_MAX_FRONT_PAGES` | `4` | Front pages scanned for title/authors/abstract |
 | `RPS_ABSTRACT_CHARS` | `1200` | Max abstract characters stored |
-| `RPS_FULLTEXT_CHARS` | `4000` | Max body characters indexed per paper |
+| `RPS_FULLTEXT_CHARS` | `200000` | Max body characters indexed for full‑text search (`0` = no cap) |
+| `RPS_PREVIEW_CHARS` | `4000` | Body slice kept for result snippets/display |
 | `RPS_SNIPPET_LEN` | `280` | Result snippet length |
 | `RPS_SEARCH_CANDIDATE_LIMIT` | `240` | Candidate rows re‑ranked per query |
 | `RPS_INDEX_COMMIT_BATCH` | `20` | Rows per DB commit while indexing |
@@ -96,15 +100,18 @@ as you would any other process output.
 ## How it works
 
 1. **Walk** the directory for `*.pdf` files.
-2. **Extract** structured fields from the first few pages plus a capped slice of
-   body text (in parallel worker processes).
-3. **Store** them in SQLite; an FTS5 virtual table + triggers keep a full‑text
-   index in sync.
-4. **Search** runs an FTS/BM25 candidate query, then re‑ranks candidates in
-   Python with exact + fuzzy matching for precise ordering.
+2. **Extract** structured fields from the first few pages plus the **full body
+   text** (in parallel worker processes).
+3. **Store** them in SQLite; an FTS5 virtual table + triggers keep a whole‑document
+   full‑text index in sync. Only a short `preview` of the body is kept in the base
+   table for display, so search stays fast.
+4. **Search** runs an FTS/BM25 candidate query over the whole document, then
+   re‑ranks candidates in Python with exact + fuzzy matching on the short,
+   high‑signal fields for precise ordering.
 
 The index lives *inside the scanned folder* as `.pdf_search_index.db` (plus WAL
-sidecars), so it travels with the papers and is ignored by git.
+sidecars), so it travels with the papers and is ignored by git. Upgrading to a
+new index format triggers a **one‑time re‑index** of that folder on next open.
 
 ---
 

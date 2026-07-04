@@ -80,21 +80,39 @@ def _env_int(name: str, default: int) -> int:
 DB_FILENAME = os.environ.get("RPS_DB_FILENAME", ".pdf_search_index.db")
 MAX_FRONT_PAGES = _env_int("RPS_MAX_FRONT_PAGES", 4)
 ABSTRACT_CHARS = _env_int("RPS_ABSTRACT_CHARS", 1200)
-FULLTEXT_CHARS = _env_int("RPS_FULLTEXT_CHARS", 4000)
+# Full body text goes into the FTS index so the whole paper is searchable.
+# 0 means "no cap"; the default bounds pathological/huge PDFs.
+FULLTEXT_CHARS = _env_int("RPS_FULLTEXT_CHARS", 200000)
+# A short slice of the body kept in the base table for display/snippets only.
+PREVIEW_CHARS = _env_int("RPS_PREVIEW_CHARS", 4000)
 SNIPPET_LEN = _env_int("RPS_SNIPPET_LEN", 280)
 SEARCH_CANDIDATE_LIMIT = _env_int("RPS_SEARCH_CANDIDATE_LIMIT", 240)
 INDEX_COMMIT_BATCH = _env_int("RPS_INDEX_COMMIT_BATCH", 20)
 SQLITE_BUSY_MS = _env_int("RPS_SQLITE_BUSY_MS", 5000)
 INDEX_WORKERS = _env_int("RPS_INDEX_WORKERS", 0)  # 0 = auto (detect CPU count)
 
-FIELD_WEIGHTS = {
+# Weights for the Python re-ranking pass. It runs only over the small,
+# high-signal fields loaded per candidate; the full body is ranked by BM25 in
+# SQLite, not here, so it must not appear in this map.
+SCORE_WEIGHTS = {
     "title": 5.0,
     "keywords": 4.0,
     "abstract": 3.0,
     "authors": 2.0,
-    "fulltext": 1.0,
+    "preview": 1.0,
 }
 
+# Columns pulled into Python per candidate. `fulltext` is deliberately excluded
+# so large bodies never enter the hot search path (BM25 reads it in SQLite).
+RESULT_COLUMNS = (
+    "id", "path", "filename", "title", "authors", "year",
+    "abstract", "keywords", "preview", "doi", "arxiv_id",
+)
+_FTS_SELECT = ", ".join(f"papers.{col}" for col in RESULT_COLUMNS)
+_ROW_SELECT = ", ".join(RESULT_COLUMNS)
+
+# Fields the SQL fallback (no FTS5) substring-scans — includes the full body so
+# the degraded path can still find body matches.
 SEARCH_FIELDS = ("title", "keywords", "abstract", "authors", "fulltext")
 
 YEAR_RE = re.compile(r"\b(19[5-9]\d|20[0-4]\d)\b")
@@ -111,38 +129,56 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _accumulate_pages(
+    page_texts,
+    max_front_pages: int,
+    char_limit: int,
+) -> tuple[list[str], str]:
+    """
+    Consume per-page text, returning the first ``max_front_pages`` pages verbatim
+    (for field extraction) and the concatenated body up to ``char_limit`` chars
+    (``char_limit <= 0`` means the whole document).
+    """
+    front_pages: list[str] = []
+    text_parts: list[str] = []
+    collected = 0
+    unlimited = char_limit <= 0
+
+    for page_index, text in enumerate(page_texts):
+        want_more = unlimited or collected < char_limit
+        if page_index >= max_front_pages and not want_more:
+            break
+        if page_index < max_front_pages:
+            front_pages.append(text)
+        if text and want_more:
+            chunk = text if unlimited else text[: char_limit - collected]
+            text_parts.append(chunk)
+            collected += len(chunk)
+
+    return front_pages, " ".join(text_parts)
+
+
 def _extract_pdf_content(
     pdf_path: str,
     max_front_pages: int = MAX_FRONT_PAGES,
     char_limit: int = FULLTEXT_CHARS,
 ) -> tuple[list[str], str]:
     """
-    Extract both the front pages and limited full text in a single pass.
-    This avoids opening and parsing the same PDF twice.
+    Extract the front pages and the full body text in a single pass, so the whole
+    paper is searchable. Front pages feed structured field extraction; the body
+    (capped at ``char_limit``) is indexed for full-text search.
     """
-    front_pages: list[str] = []
-    text_parts: list[str] = []
-    collected = 0
-
     if PDFPLUMBER_OK:
         try:
             with pdfplumber.open(pdf_path) as pdf:
-                for page_index, page in enumerate(pdf.pages):
-                    if page_index >= max_front_pages and collected >= char_limit:
-                        break
-                    try:
-                        text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-                    except Exception:
-                        text = ""
+                def texts():
+                    for page in pdf.pages:
+                        try:
+                            yield page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                        except Exception:
+                            yield ""
 
-                    if page_index < max_front_pages:
-                        front_pages.append(text)
-
-                    if text and collected < char_limit:
-                        remaining = char_limit - collected
-                        text_parts.append(text[:remaining])
-                        collected += len(text)
-            return front_pages, " ".join(text_parts)
+                return _accumulate_pages(texts(), max_front_pages, char_limit)
         except Exception:
             LOGGER.exception("pdfplumber extraction failed for %s", pdf_path)
 
@@ -150,22 +186,15 @@ def _extract_pdf_content(
         from pypdf import PdfReader
 
         reader = PdfReader(pdf_path)
-        for page_index, page in enumerate(reader.pages):
-            if page_index >= max_front_pages and collected >= char_limit:
-                break
-            try:
-                text = page.extract_text() or ""
-            except Exception:
-                text = ""
 
-            if page_index < max_front_pages:
-                front_pages.append(text)
+        def texts():
+            for page in reader.pages:
+                try:
+                    yield page.extract_text() or ""
+                except Exception:
+                    yield ""
 
-            if text and collected < char_limit:
-                remaining = char_limit - collected
-                text_parts.append(text[:remaining])
-                collected += len(text)
-        return front_pages, " ".join(text_parts)
+        return _accumulate_pages(texts(), max_front_pages, char_limit)
     except Exception:
         LOGGER.exception("PDF extraction failed for %s", pdf_path)
         return [], ""
@@ -177,16 +206,20 @@ def _extract_pdf_content(
 
 def _extract_fields(pdf_path: str) -> dict[str, str]:
     """
-    Extract structured fields from a research paper PDF.
-    Returns dict with: title, authors, year, abstract, keywords, fulltext, doi, arxiv_id
+    Extract structured fields from a research paper PDF. Returns a dict with:
+    title, authors, year, abstract, keywords, fulltext, preview, doi, arxiv_id.
+    ``fulltext`` is the whole body (for the FTS index); ``preview`` is a short
+    slice kept for display.
     """
-    pages, fulltext = _extract_pdf_content(
+    pages, body = _extract_pdf_content(
         pdf_path,
         max_front_pages=MAX_FRONT_PAGES,
         char_limit=FULLTEXT_CHARS,
     )
     if not pages:
         return {}
+
+    clean_body = _clean(body)
 
     page0 = pages[0]
     combined_front = "\n".join(pages[:2])
@@ -219,7 +252,8 @@ def _extract_fields(pdf_path: str) -> dict[str, str]:
         "year": year,
         "abstract": _clean(abstract)[:ABSTRACT_CHARS],
         "keywords": _clean(keywords)[:400],
-        "fulltext": _clean(fulltext)[:FULLTEXT_CHARS],
+        "fulltext": clean_body,
+        "preview": clean_body[:PREVIEW_CHARS],
         "doi": doi_match.group(0)[:200] if doi_match else "",
         "arxiv_id": arxiv_match.group(1)[:50] if arxiv_match else "",
     }
@@ -303,7 +337,8 @@ CREATE TABLE IF NOT EXISTS papers (
     year        TEXT    DEFAULT '',
     abstract    TEXT    DEFAULT '',
     keywords    TEXT    DEFAULT '',
-    fulltext    TEXT    DEFAULT '',
+    fulltext    TEXT    DEFAULT '',   -- whole body; indexed by FTS for search
+    preview     TEXT    DEFAULT '',   -- short slice of the body; display only
     doi         TEXT    DEFAULT '',
     arxiv_id    TEXT    DEFAULT '',
     indexed_at  TEXT    DEFAULT (datetime('now'))
@@ -362,6 +397,10 @@ def _sqlite_has_fts5() -> bool:
 # is no need to query sqlite_master on every search.
 FTS5_AVAILABLE = _sqlite_has_fts5()
 
+# Bump when the stored fields change in a way that requires re-extraction.
+# v2 introduced whole-body full-text indexing (previously only ~4k chars).
+INDEX_FORMAT_VERSION = 2
+
 
 def get_db_path(directory: str) -> str:
     return os.path.join(directory, DB_FILENAME)
@@ -376,8 +415,28 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA cache_size=-32000")
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(BASE_SCHEMA)
+
+    # Add columns introduced after the original release (idempotent for old DBs).
+    if "preview" not in _table_columns(conn, "papers"):
+        conn.execute("ALTER TABLE papers ADD COLUMN preview TEXT DEFAULT ''")
+
+    # One-time re-index when the extraction format changes (e.g. whole-body FTS).
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < INDEX_FORMAT_VERSION:
+        if version:  # a brand-new database has nothing to re-index
+            LOGGER.info(
+                "Index format v%d -> v%d; clearing cache to re-index full text.",
+                version, INDEX_FORMAT_VERSION,
+            )
+        conn.execute("DELETE FROM papers")
+        conn.execute(f"PRAGMA user_version = {INDEX_FORMAT_VERSION}")
+
     if FTS5_AVAILABLE:
         conn.executescript(FTS_SCHEMA)
         papers_exist = conn.execute("SELECT EXISTS(SELECT 1 FROM papers LIMIT 1)").fetchone()[0]
@@ -413,9 +472,9 @@ def upsert_paper(
     conn.execute(
         """
         INSERT INTO papers (path, mtime, size, filename, title, authors, year,
-                            abstract, keywords, fulltext, doi, arxiv_id, indexed_at)
+                            abstract, keywords, fulltext, preview, doi, arxiv_id, indexed_at)
         VALUES (:path, :mtime, :size, :filename, :title, :authors, :year,
-                :abstract, :keywords, :fulltext, :doi, :arxiv_id, datetime('now'))
+                :abstract, :keywords, :fulltext, :preview, :doi, :arxiv_id, datetime('now'))
         ON CONFLICT(path) DO UPDATE SET
             mtime = excluded.mtime,
             size = excluded.size,
@@ -426,6 +485,7 @@ def upsert_paper(
             abstract = excluded.abstract,
             keywords = excluded.keywords,
             fulltext = excluded.fulltext,
+            preview = excluded.preview,
             doi = excluded.doi,
             arxiv_id = excluded.arxiv_id,
             indexed_at = excluded.indexed_at
@@ -437,7 +497,8 @@ def upsert_paper(
             "filename": os.path.basename(path),
             **{
                 key: fields.get(key, "")
-                for key in ("title", "authors", "year", "abstract", "keywords", "fulltext", "doi", "arxiv_id")
+                for key in ("title", "authors", "year", "abstract", "keywords",
+                            "fulltext", "preview", "doi", "arxiv_id")
             },
         },
     )
@@ -564,11 +625,14 @@ def index_directory(
                             cancelled = True
                             executor.shutdown(wait=False, cancel_futures=True)
                             break
-                        path_str, mtime, size = futures[future]
+                        # pop + del so each (now large) body result is freed
+                        # right after storing, not retained until the loop ends.
+                        path_str, mtime, size = futures.pop(future)
                         try:
                             store(path_str, mtime, size, future.result(), None)
                         except Exception as exc:  # extraction raised in a worker
                             store(path_str, mtime, size, None, exc)
+                        del future
             except Exception:
                 LOGGER.exception("Process pool unavailable; using serial extraction")
                 use_pool = False
@@ -637,8 +701,8 @@ def _fetch_candidate_rows(
         fts_query = _fts_query(terms)
         if fts_query:
             try:
-                sql = """
-                    SELECT papers.*
+                sql = f"""
+                    SELECT {_FTS_SELECT}
                     FROM papers_fts
                     JOIN papers ON papers.id = papers_fts.rowid
                     WHERE papers_fts MATCH ?
@@ -672,7 +736,7 @@ def _fetch_candidate_rows(
     if term_clauses:
         where_clauses.append("(" + " OR ".join(term_clauses) + ")")
 
-    sql = "SELECT * FROM papers"
+    sql = f"SELECT {_ROW_SELECT} FROM papers"
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
     sql += " LIMIT ?"
@@ -681,19 +745,22 @@ def _fetch_candidate_rows(
 
 
 def score_paper(terms: list[str], row: sqlite3.Row) -> float:
-    """Score a paper against a list of query terms."""
+    """
+    Bonus score from exact/fuzzy matches in the short, high-signal fields. This
+    refines the BM25 candidate order; it does not gate results (a paper whose
+    only match is deep in the body scores 0 here but is still a valid hit).
+    """
     total = 0.0
-    fields = {field: (row[field] or "") for field in SEARCH_FIELDS}
-    lower_fields = {field: value.lower() for field, value in fields.items()}
+    fields = {name: (row[name] or "") for name in SCORE_WEIGHTS}
+    lower_fields = {name: value.lower() for name, value in fields.items()}
 
     for term in terms:
-        for field, text in fields.items():
-            weight = FIELD_WEIGHTS[field]
-            if term in lower_fields[field]:
+        for name, weight in SCORE_WEIGHTS.items():
+            if term in lower_fields[name]:
                 total += weight * 100
                 continue
-            if field in ("title", "abstract", "keywords"):
-                fuzzy_score = _fuzzy_score(term, text[:500])
+            if name in ("title", "abstract", "keywords"):
+                fuzzy_score = _fuzzy_score(term, fields[name][:500])
                 if fuzzy_score > 60:
                     total += weight * fuzzy_score * 0.5
     return total
@@ -711,11 +778,14 @@ def search(
         return []
 
     rows = _fetch_candidate_rows(conn, terms, year_filter, top_n=top_n)
+    # Candidates arrive best-first (BM25 for FTS). Keep that as a base score so a
+    # paper matched only deep in the body is retained, then let the field-level
+    # bonus lift exact title/keyword hits above it.
+    total_rows = len(rows)
     results: list[tuple[float, dict[str, object]]] = []
-    for row in rows:
-        score = score_paper(terms, row)
-        if score > 0:
-            results.append((score, dict(row)))
+    for position, row in enumerate(rows):
+        base = total_rows - position
+        results.append((base + score_paper(terms, row), dict(row)))
 
     results.sort(key=lambda item: -item[0])
     max_score = results[0][0] if results else 1.0
@@ -974,8 +1044,8 @@ class ResultCard(tk.Frame):
                         relief="flat",
                     ).pack(side="left", padx=2)
 
-        abstract = result.get("abstract") or result.get("fulltext", "")
-        snippet = make_snippet(abstract, terms)
+        snippet_source = result.get("abstract") or result.get("preview", "")
+        snippet = make_snippet(snippet_source, terms)
         if snippet:
             tk.Label(
                 self,
