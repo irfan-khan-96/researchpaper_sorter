@@ -19,6 +19,9 @@ so re‑opening a large library is near‑instant.
 - **Whole‑document full‑text search** — the entire body of each paper is indexed,
   so you can find a concept that appears anywhere (methods, results, discussion),
   not just in the title or abstract.
+- **Exact‑match collection** — copy every paper that strictly contains *all* of
+  your keywords out of a massive unsorted folder into a separate one, with zero
+  false positives (whole‑word matching only).
 - **Incremental indexing** — files are skipped unless their size or modification
   time changed.
 - **Parallel extraction** — PDF text extraction is fanned out across CPU cores,
@@ -65,6 +68,24 @@ python research_paper_search.py --index /path/to/papers --workers 4    # pin wor
 ```
 The next time you open that folder in the UI, search is immediate.
 
+### Collect exact matches into a folder
+Copy every paper that **exactly** contains *all* of the given keywords out of a
+large unsorted folder into a separate one — like sorting a pile of downloads by
+content. Matching is strict whole‑word (no substring, stem, or fuzzy hits), so
+there are **zero false positives**; a paper qualifies only if every keyword is
+present.
+
+In the desktop UI, click **“Collect exact matches…”**, or headlessly:
+```bash
+python research_paper_search.py --index /unsorted/papers \
+    --collect --dest /sorted/p53_cancer --keywords "p53, cancer"
+python research_paper_search.py --index /unsorted/papers \
+    --collect --dest /out --keywords "CRISPR" --match-case
+```
+Keywords are comma‑separated and may be phrases (e.g. `"machine learning"`).
+Indexing is cached and parallel, so even a massive folder is fast after the first
+pass; only the matching PDFs are copied (originals are left untouched).
+
 ---
 
 ## Configuration
@@ -84,6 +105,7 @@ defaults — nothing is hard‑coded. Override any of these before launching:
 | `RPS_INDEX_COMMIT_BATCH` | `20` | Rows per DB commit while indexing |
 | `RPS_SQLITE_BUSY_MS` | `5000` | SQLite busy timeout (ms) |
 | `RPS_INDEX_WORKERS` | `0` | Extraction worker processes (`0` = auto‑detect CPUs, capped at 8) |
+| `RPS_RENDER_BATCH` | `4` | Result cards drawn per UI tick (keeps the search box responsive) |
 | `RPS_LOG_LEVEL` | `WARNING` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 
 Example (PowerShell):

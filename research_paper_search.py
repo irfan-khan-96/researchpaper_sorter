@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -57,6 +58,10 @@ def configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    # pdfminer (via pdfplumber) emits noisy WARNINGs for malformed font/box
+    # descriptors ("Could not get FontBBox ...") that are harmless to indexing.
+    # Keep real errors, drop the noise.
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 
 configure_logging()
@@ -90,6 +95,8 @@ SEARCH_CANDIDATE_LIMIT = _env_int("RPS_SEARCH_CANDIDATE_LIMIT", 240)
 INDEX_COMMIT_BATCH = _env_int("RPS_INDEX_COMMIT_BATCH", 20)
 SQLITE_BUSY_MS = _env_int("RPS_SQLITE_BUSY_MS", 5000)
 INDEX_WORKERS = _env_int("RPS_INDEX_WORKERS", 0)  # 0 = auto (detect CPU count)
+# Result cards built per event-loop tick; keeps the search box responsive.
+RENDER_BATCH_SIZE = _env_int("RPS_RENDER_BATCH", 4)
 
 # Weights for the Python re-ranking pass. It runs only over the small,
 # high-signal fields loaded per candidate; the full body is ranked by BM25 in
@@ -817,6 +824,181 @@ def make_snippet(text: str, terms: list[str], length: int = SNIPPET_LEN) -> str:
 
 
 # -----------------------------------------------------------------------------
+# EXACT-MATCH AGGREGATION
+#
+# Collect every paper in a source folder that *exactly* contains ALL of the
+# given keywords into a destination folder. Correctness is paramount here, so
+# the fuzzy/prefix/BM25 interactive search is deliberately NOT used as the gate:
+# FTS only narrows candidates quickly; a strict whole-word regex makes the final
+# decision, guaranteeing zero false positives (no substring, stem, or fuzzy hits).
+# -----------------------------------------------------------------------------
+
+# Fields (in the base table) whose text is checked for an exact keyword match.
+MATCH_FIELDS = ("title", "authors", "abstract", "keywords", "fulltext")
+
+
+class AggregateStats(NamedTuple):
+    total_indexed: int
+    candidates: int
+    matched: int
+    copied: int
+    errors: int
+    cancelled: bool
+    dest_dir: str
+
+
+def parse_keywords(raw: str) -> list[str]:
+    """Split a keyword string on commas / newlines / semicolons; keep phrases."""
+    parts = re.split(r"[,\n;]+", raw or "")
+    seen: dict[str, None] = {}
+    for part in parts:
+        cleaned = " ".join(part.split())  # collapse internal whitespace
+        if cleaned:
+            seen.setdefault(cleaned, None)
+    return list(seen)
+
+
+def compile_keyword_patterns(keywords: list[str], match_case: bool) -> list[re.Pattern]:
+    """
+    One whole-word/phrase regex per keyword. Word boundaries are enforced with
+    lookarounds so a keyword only matches as a standalone token (e.g. "ion" does
+    NOT match "ionization"), eliminating substring false positives. Multi-word
+    keywords tolerate variable inter-word whitespace only.
+    """
+    flags = 0 if match_case else re.IGNORECASE
+    patterns: list[re.Pattern] = []
+    for keyword in keywords:
+        tokens = keyword.split()
+        if not tokens:
+            continue
+        body = r"\s+".join(re.escape(token) for token in tokens)
+        patterns.append(re.compile(rf"(?<!\w){body}(?!\w)", flags))
+    return patterns
+
+
+def paper_matches(row, patterns: list[re.Pattern]) -> bool:
+    """A paper matches only if EVERY keyword pattern is found in its text."""
+    text = " ".join(str(row[field] or "") for field in MATCH_FIELDS)
+    return all(pattern.search(text) for pattern in patterns)
+
+
+def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlite3.Row]:
+    """
+    Narrow to papers that plausibly contain all keywords. FTS does this fast over
+    huge collections; the caller still verifies each hit exactly. Falls back to a
+    full scan when FTS5 is unavailable (correctness is unaffected either way).
+    """
+    columns = ", ".join(f"papers.{field}" for field in MATCH_FIELDS)
+    if FTS5_AVAILABLE:
+        phrases = []
+        for keyword in keywords:
+            tokens = re.sub(r'"', " ", keyword).split()
+            if tokens:
+                phrases.append('"' + " ".join(tokens) + '"')
+        if phrases:
+            match_query = " AND ".join(phrases)
+            try:
+                sql = (
+                    f"SELECT {columns}, papers.path FROM papers_fts "
+                    "JOIN papers ON papers.id = papers_fts.rowid "
+                    "WHERE papers_fts MATCH ?"
+                )
+                return conn.execute(sql, [match_query]).fetchall()
+            except sqlite3.OperationalError:
+                LOGGER.warning("Aggregation FTS query failed; scanning all rows.", exc_info=True)
+
+    return conn.execute(f"SELECT {columns}, path FROM papers").fetchall()
+
+
+def _copy_into(paths: list[str], dest_dir: str) -> tuple[int, int]:
+    """Copy files into dest_dir, de-duplicating colliding names. Returns (copied, errors)."""
+    os.makedirs(dest_dir, exist_ok=True)
+    copied = errors = 0
+    used: set[str] = set()
+    for path in paths:
+        try:
+            base = os.path.basename(path)
+            target = os.path.join(dest_dir, base)
+            if target in used or os.path.exists(target):
+                stem, ext = os.path.splitext(base)
+                counter = 1
+                while True:
+                    candidate = os.path.join(dest_dir, f"{stem} ({counter}){ext}")
+                    if candidate not in used and not os.path.exists(candidate):
+                        target = candidate
+                        break
+                    counter += 1
+            shutil.copy2(path, target)
+            used.add(target)
+            copied += 1
+        except OSError as exc:
+            errors += 1
+            LOGGER.warning("Could not copy %s: %s", path, exc)
+    return copied, errors
+
+
+def aggregate_matches(
+    source_dir: str,
+    dest_dir: str,
+    keywords: list[str],
+    *,
+    match_case: bool = False,
+    workers: Optional[int] = None,
+    progress: Optional[Callable[[str, int, int, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> AggregateStats:
+    """
+    Copy every paper under ``source_dir`` that exactly contains ALL ``keywords``
+    into ``dest_dir``. ``progress(phase, done, total, name)`` reports the
+    "index" and "match" phases; ``should_cancel()`` allows interruption.
+    """
+    report = progress or (lambda *_: None)
+    cancel = should_cancel or (lambda: False)
+
+    patterns = compile_keyword_patterns(keywords, match_case)
+    if not patterns:
+        return AggregateStats(0, 0, 0, 0, 0, False, dest_dir)
+
+    db_path = get_db_path(source_dir)
+    index_stats = index_directory(
+        source_dir,
+        db_path,
+        workers=workers,
+        progress=lambda done, total, name: report("index", done, total, name),
+        should_cancel=should_cancel,
+    )
+    if index_stats.cancelled:
+        return AggregateStats(index_stats.total, 0, 0, 0, index_stats.errors, True, dest_dir)
+
+    dest_prefix = os.path.abspath(dest_dir) + os.sep
+    conn = open_db(db_path)
+    try:
+        rows = _candidate_rows(conn, keywords)
+        candidates = len(rows)
+        matched: list[str] = []
+        for position, row in enumerate(rows, start=1):
+            if cancel():
+                return AggregateStats(index_stats.total, candidates, len(matched), 0,
+                                      index_stats.errors, True, dest_dir)
+            report("match", position, candidates, "")
+            path = row["path"]
+            # Never re-collect files already sitting in the destination folder.
+            if os.path.abspath(path).startswith(dest_prefix):
+                continue
+            if paper_matches(row, patterns):
+                matched.append(path)
+    finally:
+        with suppress(sqlite3.Error):
+            conn.close()
+
+    copied, copy_errors = _copy_into(matched, dest_dir)
+    return AggregateStats(
+        index_stats.total, candidates, len(matched), copied,
+        index_stats.errors + copy_errors, False, dest_dir,
+    )
+
+
+# -----------------------------------------------------------------------------
 # GUI
 # -----------------------------------------------------------------------------
 
@@ -1103,6 +1285,213 @@ class ResultCard(tk.Frame):
         self._set_background_recursive(self, THEME["card"])
 
 
+class CollectDialog(tk.Toplevel):
+    """Copy papers that exactly contain ALL keywords from a source to a folder."""
+
+    def __init__(self, parent: "App", source_default: str):
+        super().__init__(parent)
+        self.title("Collect exact matches")
+        self.configure(bg=THEME["bg"], padx=16, pady=14)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        self._running = False
+        self._cancelled = False
+        self._closing = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._source_var = tk.StringVar(value=source_default)
+        self._keywords_var = tk.StringVar()
+        self._dest_var = tk.StringVar()
+        self._match_case_var = tk.BooleanVar(value=False)
+
+        self._build()
+        self.bind("<Escape>", lambda _e: self._on_close(), add="+")
+
+    # UI ----------------------------------------------------------------------
+
+    def _row_label(self, text: str, row: int) -> None:
+        tk.Label(
+            self, text=text, bg=THEME["bg"], fg=THEME["subtext"],
+            font=THEME["font_small"], anchor="w",
+        ).grid(row=row, column=0, sticky="w", pady=(6, 0))
+
+    def _entry(self, var: tk.StringVar, width: int = 46) -> tk.Entry:
+        return tk.Entry(
+            self, textvariable=var, width=width, bg=THEME["entry_bg"], fg=THEME["text"],
+            insertbackground=THEME["text"], font=THEME["font_main"], bd=0,
+            highlightthickness=1, highlightbackground=THEME["border"],
+            highlightcolor=THEME["accent"],
+        )
+
+    def _folder_button(self, var: tk.StringVar, title: str, row: int) -> None:
+        tk.Button(
+            self, text="Browse", bg=THEME["surface"], fg=THEME["subtext"],
+            font=THEME["font_small"], bd=0, padx=10, pady=4, cursor="hand2",
+            activebackground=THEME["accent_soft"], activeforeground=THEME["text"],
+            command=lambda: self._pick_folder(var, title),
+        ).grid(row=row, column=2, sticky="w", padx=(6, 0), pady=(2, 0))
+
+    def _build(self) -> None:
+        tk.Label(
+            self, text="Copy papers that exactly contain ALL keywords into a folder.",
+            bg=THEME["bg"], fg=THEME["text"], font=THEME["font_title"], anchor="w",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        self._row_label("Source folder", 1)
+        self._entry(self._source_var).grid(row=1, column=1, sticky="we", padx=(8, 0), pady=(2, 0), ipady=4)
+        self._folder_button(self._source_var, "Select source folder", 1)
+
+        self._row_label("Keywords (comma-separated, ALL must match)", 2)
+        kw_entry = self._entry(self._keywords_var)
+        kw_entry.grid(row=2, column=1, sticky="we", padx=(8, 0), pady=(2, 0), ipady=4)
+
+        self._row_label("Destination folder", 3)
+        self._entry(self._dest_var).grid(row=3, column=1, sticky="we", padx=(8, 0), pady=(2, 0), ipady=4)
+        self._folder_button(self._dest_var, "Select destination folder", 3)
+
+        tk.Checkbutton(
+            self, text="Match case", variable=self._match_case_var, bg=THEME["bg"],
+            fg=THEME["subtext"], font=THEME["font_small"], activebackground=THEME["bg"],
+            selectcolor=THEME["entry_bg"], anchor="w",
+        ).grid(row=4, column=1, sticky="w", pady=(8, 0))
+
+        self._status = tk.Label(
+            self, text="", bg=THEME["bg"], fg=THEME["subtext"],
+            font=THEME["font_small"], anchor="w", wraplength=560, justify="left",
+        )
+        self._status.grid(row=5, column=0, columnspan=3, sticky="we", pady=(10, 0))
+
+        button_row = tk.Frame(self, bg=THEME["bg"])
+        button_row.grid(row=6, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        self._collect_btn = tk.Button(
+            button_row, text="Collect", bg=THEME["accent"], fg="white",
+            font=THEME["font_small"], bd=0, padx=16, pady=6, cursor="hand2",
+            activebackground="#B85E31", activeforeground="white", command=self._start,
+        )
+        self._collect_btn.pack(side="right")
+        self._close_btn = tk.Button(
+            button_row, text="Close", bg=THEME["surface"], fg=THEME["subtext"],
+            font=THEME["font_small"], bd=0, padx=14, pady=6, cursor="hand2",
+            activebackground=THEME["accent_soft"], activeforeground=THEME["text"],
+            command=self._on_close,
+        )
+        self._close_btn.pack(side="right", padx=(0, 8))
+
+        self.columnconfigure(1, weight=1)
+
+    def _pick_folder(self, var: tk.StringVar, title: str) -> None:
+        path = filedialog.askdirectory(title=title, parent=self)
+        if path:
+            var.set(path)
+
+    # Run ---------------------------------------------------------------------
+
+    def _set_status(self, message: str, color: Optional[str] = None) -> None:
+        self._status.configure(text=message, fg=color or THEME["subtext"])
+
+    def _ui(self, callback, *args) -> None:
+        if self._closing:
+            return
+        with suppress(tk.TclError):
+            self.after(0, callback, *args)
+
+    def _start(self) -> None:
+        if self._running:
+            return
+        source = self._source_var.get().strip()
+        dest = self._dest_var.get().strip()
+        keywords = parse_keywords(self._keywords_var.get())
+
+        if not os.path.isdir(source):
+            messagebox.showerror("Collect", f"Source folder not found:\n{source}", parent=self)
+            return
+        if not keywords:
+            messagebox.showerror("Collect", "Enter at least one keyword.", parent=self)
+            return
+        if not dest:
+            messagebox.showerror("Collect", "Choose a destination folder.", parent=self)
+            return
+        if os.path.abspath(dest) == os.path.abspath(source):
+            messagebox.showerror("Collect", "Destination must differ from the source.", parent=self)
+            return
+
+        self._running = True
+        self._cancelled = False
+        self._collect_btn.configure(state="disabled", text="Collecting…")
+        self._set_status("Starting…", color=THEME["accent2"])
+
+        worker = threading.Thread(
+            target=self._run,
+            args=(source, dest, keywords, self._match_case_var.get()),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run(self, source: str, dest: str, keywords: list[str], match_case: bool) -> None:
+        def progress(phase: str, done: int, total: int, name: str) -> None:
+            if phase == "index":
+                self._ui(self._set_status, f"Indexing {done}/{total}: {name[:48]}")
+            else:
+                self._ui(self._set_status, f"Scanning matches {done}/{total}…")
+
+        try:
+            stats = aggregate_matches(
+                source, dest, keywords,
+                match_case=match_case,
+                progress=progress,
+                should_cancel=lambda: self._cancelled or self._closing,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.exception("Collect failed")
+            self._ui(self._finish_error, str(exc))
+            return
+        self._ui(self._finish_ok, stats)
+
+    def _finish_error(self, message: str) -> None:
+        self._running = False
+        self._collect_btn.configure(state="normal", text="Collect")
+        self._set_status(f"Failed: {message}", color=THEME["red"])
+
+    def _finish_ok(self, stats: AggregateStats) -> None:
+        self._running = False
+        self._collect_btn.configure(state="normal", text="Collect")
+        if stats.cancelled:
+            self._set_status("Cancelled.", color=THEME["highlight"])
+            return
+        summary = (
+            f"Scanned {stats.total_indexed} papers, {stats.candidates} candidates, "
+            f"{stats.matched} exact matches, {stats.copied} copied."
+        )
+        if stats.errors:
+            summary += f" {stats.errors} errors."
+        self._set_status(summary, color=THEME["green"] if stats.copied else THEME["subtext"])
+        if stats.copied:
+            open_it = messagebox.askyesno(
+                "Collect complete",
+                f"{summary}\n\nOpen the destination folder?",
+                parent=self,
+            )
+            if open_it:
+                with suppress(Exception):
+                    if sys.platform == "win32":
+                        os.startfile(stats.dest_dir)
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", stats.dest_dir])
+                    else:
+                        subprocess.Popen(["xdg-open", stats.dest_dir])
+        elif stats.matched == 0:
+            messagebox.showinfo("Collect complete", summary, parent=self)
+
+    def _on_close(self) -> None:
+        if self._running:
+            self._cancelled = True
+            self._set_status("Cancelling…", color=THEME["highlight"])
+            return
+        self._closing = True
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1120,6 +1509,8 @@ class App(tk.Tk):
         self._pending_index_request: Optional[tuple[str, str, bool, int]] = None
         self._last_query = ""
         self._search_after_id = None
+        self._render_token = 0
+        self._render_after_id = None
         self._closing = False
 
         self._setup_styles()
@@ -1231,7 +1622,24 @@ class App(tk.Tk):
             activebackground=THEME["accent_soft"],
             activeforeground=THEME["text"],
             command=self._reindex,
-        ).pack(side="left", padx=(0, 14))
+        ).pack(side="left", padx=(0, 6))
+
+        collect_btn = tk.Button(
+            dir_bar,
+            text="Collect exact matches…",
+            bg=THEME["accent2"],
+            fg="white",
+            font=THEME["font_small"],
+            bd=0,
+            padx=12,
+            pady=6,
+            cursor="hand2",
+            activebackground="#7A4F37",
+            activeforeground="white",
+            command=self._open_collect_dialog,
+        )
+        collect_btn.pack(side="left", padx=(0, 14))
+        Tooltip(collect_btn, "Copy papers that exactly contain ALL keywords to a folder")
 
         self._progress = ttk.Progressbar(self, mode="indeterminate", style="TProgressbar")
 
@@ -1336,6 +1744,7 @@ class App(tk.Tk):
     def _on_close(self) -> None:
         self._closing = True
         self._index_job_id += 1
+        self._cancel_render()
         if self._search_after_id:
             with suppress(tk.TclError):
                 self.after_cancel(self._search_after_id)
@@ -1402,6 +1811,10 @@ class App(tk.Tk):
             messagebox.showinfo("No directory", "Please select a directory first.")
             return
         self._start_indexing(self._directory, self._db_path, force_reindex=True)
+
+    def _open_collect_dialog(self) -> None:
+        dialog = CollectDialog(self, source_default=self._directory)
+        dialog.focus_set()
 
     # Indexing -----------------------------------------------------------------
 
@@ -1511,7 +1924,16 @@ class App(tk.Tk):
 
     # Results -----------------------------------------------------------------
 
+    def _cancel_render(self) -> None:
+        """Invalidate any in-flight incremental render."""
+        self._render_token += 1
+        if self._render_after_id:
+            with suppress(tk.TclError):
+                self.after_cancel(self._render_after_id)
+            self._render_after_id = None
+
     def _clear_results(self) -> None:
+        self._cancel_render()
         for widget in self._cards_frame.winfo_children():
             widget.destroy()
         self._placeholder = tk.Label(
@@ -1526,6 +1948,7 @@ class App(tk.Tk):
         self._results_label.config(text="")
 
     def _render_results(self, results: list[dict], terms: list[str]) -> None:
+        self._cancel_render()
         for widget in self._cards_frame.winfo_children():
             widget.destroy()
 
@@ -1544,16 +1967,27 @@ class App(tk.Tk):
         self._results_label.config(
             text=f"  {len(results)} result{'s' if len(results) != 1 else ''} found"
         )
+        # Build cards a few at a time, yielding to the event loop between batches,
+        # so the search box stays responsive while typing (Tk is single-threaded).
+        self._render_batch(self._render_token, results, terms, 0)
 
-        for result in results:
+    def _render_batch(self, token: int, results: list[dict], terms: list[str], start: int) -> None:
+        if token != self._render_token or self._closing:
+            return
+        end = min(start + RENDER_BATCH_SIZE, len(results))
+        for index in range(start, end):
             card = ResultCard(
                 self._cards_frame,
-                result,
+                results[index],
                 terms,
                 on_open=self._open_pdf,
                 on_reveal=self._reveal_in_explorer,
             )
             card.pack(fill="x", padx=8, pady=4)
+        if end < len(results):
+            self._render_after_id = self.after(1, self._render_batch, token, results, terms, end)
+        else:
+            self._render_after_id = None
 
     # Actions -----------------------------------------------------------------
 
@@ -1618,6 +2052,35 @@ def _run_headless_index(directory: str, force: bool, workers: Optional[int]) -> 
     return 1 if stats.errors else 0
 
 
+def _run_headless_collect(
+    source: str, dest: str, raw_keywords: str, match_case: bool, workers: Optional[int]
+) -> int:
+    """Collect exactly-matching papers from source into dest, headlessly."""
+    source = os.path.abspath(source)
+    if not os.path.isdir(source):
+        print(f"Not a directory: {source}", file=sys.stderr)
+        return 2
+    keywords = parse_keywords(raw_keywords)
+    if not keywords:
+        print("No keywords provided (use --keywords).", file=sys.stderr)
+        return 2
+
+    def progress(phase: str, done: int, total: int, name: str) -> None:
+        label = "Indexing" if phase == "index" else "Scanning"
+        print(f"\r{label} {done}/{total} {name[:48]:<48}", end="", file=sys.stderr, flush=True)
+
+    stats = aggregate_matches(
+        source, dest, keywords, match_case=match_case, workers=workers, progress=progress,
+    )
+    print(file=sys.stderr)
+    print(
+        f"{stats.total_indexed} papers scanned, {stats.candidates} candidates, "
+        f"{stats.matched} exact matches, {stats.copied} copied to {stats.dest_dir}"
+        + (f", {stats.errors} errors" if stats.errors else "")
+    )
+    return 1 if stats.errors else 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="research_paper_search",
@@ -1627,6 +2090,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--index",
         metavar="DIR",
         help="Index the PDFs under DIR headlessly, then exit (no UI).",
+    )
+    parser.add_argument(
+        "--collect",
+        action="store_true",
+        help="Copy papers exactly matching ALL --keywords from --index DIR into --dest.",
+    )
+    parser.add_argument(
+        "--dest",
+        metavar="DIR",
+        help="Destination folder for --collect.",
+    )
+    parser.add_argument(
+        "--keywords",
+        metavar='"a,b,c"',
+        help="Comma-separated keywords for --collect; a paper must contain them ALL exactly.",
+    )
+    parser.add_argument(
+        "--match-case",
+        action="store_true",
+        help="Make --collect keyword matching case-sensitive.",
     )
     parser.add_argument(
         "--force",
@@ -1641,6 +2124,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Extraction worker processes (0 = auto-detect CPU count).",
     )
     args = parser.parse_args(argv)
+
+    if args.collect:
+        if not args.index or not args.dest:
+            parser.error("--collect requires --index SOURCE_DIR and --dest DEST_DIR")
+        return _run_headless_collect(
+            args.index, args.dest, args.keywords or "", args.match_case, args.workers
+        )
 
     if args.index:
         return _run_headless_index(args.index, args.force, args.workers)
