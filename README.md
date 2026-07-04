@@ -21,7 +21,12 @@ so re‑opening a large library is near‑instant.
   not just in the title or abstract.
 - **Exact‑match collection** — copy every paper that strictly contains *all* of
   your keywords out of a massive unsorted folder into a separate one, with zero
-  false positives (whole‑word matching only).
+  false positives (whole‑word matching only). Papers already in the destination
+  are detected by content and skipped (never duplicated), and you're told how
+  many were skipped.
+- **Scholarly‑only** — only genuine research papers and institutional reports are
+  surfaced; other PDFs (invoices, slides, receipts…) are discarded, and the count
+  is reported so nothing goes missing silently.
 - **Incremental indexing** — files are skipped unless their size or modification
   time changed.
 - **Parallel extraction** — PDF text extraction is fanned out across CPU cores,
@@ -84,7 +89,10 @@ python research_paper_search.py --index /unsorted/papers \
 ```
 Keywords are comma‑separated and may be phrases (e.g. `"machine learning"`).
 Indexing is cached and parallel, so even a massive folder is fast after the first
-pass; only the matching PDFs are copied (originals are left untouched).
+pass; only the matching PDFs are copied (originals are left untouched). Papers
+already present in the destination are recognised by content and **skipped**, and
+documents that match but aren't genuine papers/reports are **discarded** — both
+counts are reported so you always know what happened.
 
 ---
 
@@ -99,13 +107,14 @@ defaults — nothing is hard‑coded. Override any of these before launching:
 | `RPS_MAX_FRONT_PAGES` | `4` | Front pages scanned for title/authors/abstract |
 | `RPS_ABSTRACT_CHARS` | `1200` | Max abstract characters stored |
 | `RPS_FULLTEXT_CHARS` | `200000` | Max body characters indexed for full‑text search (`0` = no cap) |
-| `RPS_PREVIEW_CHARS` | `4000` | Body slice kept for result snippets/display |
-| `RPS_SNIPPET_LEN` | `280` | Result snippet length |
+| `RPS_PREVIEW_CHARS` | `4000` | Body slice kept for the light re‑rank pass |
 | `RPS_SEARCH_CANDIDATE_LIMIT` | `240` | Candidate rows re‑ranked per query |
 | `RPS_INDEX_COMMIT_BATCH` | `20` | Rows per DB commit while indexing |
 | `RPS_SQLITE_BUSY_MS` | `5000` | SQLite busy timeout (ms) |
 | `RPS_INDEX_WORKERS` | `0` | Extraction worker processes (`0` = auto‑detect CPUs, capped at 8) |
 | `RPS_RENDER_BATCH` | `4` | Result cards drawn per UI tick (keeps the search box responsive) |
+| `RPS_REQUIRE_SCHOLARLY` | `1` | Surface only papers/reports; set `0` to index every PDF |
+| `RPS_SCHOLARLY_MIN_SIGNALS` | `2` | Scholarly signals a doc needs to be kept (lower = more permissive) |
 | `RPS_LOG_LEVEL` | `WARNING` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 
 Example (PowerShell):
@@ -124,12 +133,20 @@ as you would any other process output.
 1. **Walk** the directory for `*.pdf` files.
 2. **Extract** structured fields from the first few pages plus the **full body
    text** (in parallel worker processes).
-3. **Store** them in SQLite; an FTS5 virtual table + triggers keep a whole‑document
+3. **Classify** each document from scholarly signals (DOI, arXiv id, abstract,
+   references, reputable publisher/institution names, numbered citations). Genuine
+   papers/reports are kept; the rest are flagged and hidden from results.
+4. **Store** them in SQLite; an FTS5 virtual table + triggers keep a whole‑document
    full‑text index in sync. Only a short `preview` of the body is kept in the base
-   table for display, so search stays fast.
-4. **Search** runs an FTS/BM25 candidate query over the whole document, then
+   table for the re‑rank pass, so search stays fast.
+5. **Search** runs an FTS/BM25 candidate query over the whole document, then
    re‑ranks candidates in Python with exact + fuzzy matching on the short,
    high‑signal fields for precise ordering.
+
+**Exact collection** is separate and stricter: FTS only narrows candidates, then a
+whole‑word/phrase regex decides matches (zero false positives), a paper must match
+*every* keyword, non‑papers are excluded, and content‑identical files already in
+the destination are skipped.
 
 The index lives *inside the scanned folder* as `.pdf_search_index.db` (plus WAL
 sidecars), so it travels with the papers and is ignored by git. Upgrading to a

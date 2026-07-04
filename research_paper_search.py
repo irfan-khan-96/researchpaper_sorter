@@ -15,6 +15,7 @@ written to stderr. Nothing operational is hard-coded into the source.
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import re
@@ -90,13 +91,16 @@ ABSTRACT_CHARS = _env_int("RPS_ABSTRACT_CHARS", 1200)
 FULLTEXT_CHARS = _env_int("RPS_FULLTEXT_CHARS", 200000)
 # A short slice of the body kept in the base table for display/snippets only.
 PREVIEW_CHARS = _env_int("RPS_PREVIEW_CHARS", 4000)
-SNIPPET_LEN = _env_int("RPS_SNIPPET_LEN", 280)
 SEARCH_CANDIDATE_LIMIT = _env_int("RPS_SEARCH_CANDIDATE_LIMIT", 240)
 INDEX_COMMIT_BATCH = _env_int("RPS_INDEX_COMMIT_BATCH", 20)
 SQLITE_BUSY_MS = _env_int("RPS_SQLITE_BUSY_MS", 5000)
 INDEX_WORKERS = _env_int("RPS_INDEX_WORKERS", 0)  # 0 = auto (detect CPU count)
 # Result cards built per event-loop tick; keeps the search box responsive.
 RENDER_BATCH_SIZE = _env_int("RPS_RENDER_BATCH", 4)
+# Only surface genuine research papers / institutional reports; discard the rest.
+REQUIRE_SCHOLARLY = os.environ.get("RPS_REQUIRE_SCHOLARLY", "1") not in ("0", "false", "False", "")
+# How many scholarly signals a document needs to be treated as a paper/report.
+SCHOLARLY_MIN_SIGNALS = _env_int("RPS_SCHOLARLY_MIN_SIGNALS", 2)
 
 # Weights for the Python re-ranking pass. It runs only over the small,
 # high-signal fields loaded per candidate; the full body is ranked by BM25 in
@@ -211,6 +215,64 @@ def _extract_pdf_content(
 # FIELD EXTRACTION
 # -----------------------------------------------------------------------------
 
+# Names of reputable publishers, databases, and institution types. Presence of
+# any of these (as one of several signals) marks a document as a genuine paper
+# or institutional report rather than an arbitrary PDF.
+REPUTABLE_MARKERS = (
+    "doi.org", "arxiv", "biorxiv", "medrxiv", "ssrn", "pubmed", "pmc",
+    "ieee", "acm", "elsevier", "springer", "nature", "wiley", "sciencedirect",
+    "jstor", "taylor & francis", "sage", "oxford university press",
+    "cambridge university press", "plos", "mdpi", "frontiers", "bmj", "aaas",
+    "proceedings of", "journal of", "university", "institute", "laboratory",
+    "national laboratory", "department of", "technical report", "working paper",
+    "world health organization", "nasa", "nist", "cern", "oecd", "unesco",
+    "european commission", "national institutes of health", "research council",
+)
+_REPUTABLE_RE = re.compile("|".join(re.escape(marker) for marker in REPUTABLE_MARKERS), re.IGNORECASE)
+_REFERENCES_RE = re.compile(r"\b(references|bibliography|works cited)\b", re.IGNORECASE)
+_INTRO_RE = re.compile(r"\b(introduction|abstract|methodology|methods)\b", re.IGNORECASE)
+_CITATION_RE = re.compile(r"\[\d{1,3}\]")
+
+
+def classify_document(fields: dict) -> tuple[bool, str]:
+    """
+    Decide whether an extracted document is a genuine research paper / report.
+
+    Uses several independent scholarly signals (DOI, arXiv id, an abstract, a
+    references section, a reputable publisher/institution name, in-text numeric
+    citations). A document is accepted when it shows at least
+    ``SCHOLARLY_MIN_SIGNALS`` of them — forgiving enough not to drop real papers,
+    strict enough to discard invoices, slides, receipts, and the like. Returns
+    ``(is_scholarly, reason)``.
+    """
+    text = " ".join((
+        fields.get("title", ""),
+        fields.get("abstract", ""),
+        fields.get("keywords", ""),
+        fields.get("fulltext", ""),
+    ))
+    signals: list[str] = []
+    if fields.get("doi"):
+        signals.append("DOI")
+    if fields.get("arxiv_id"):
+        signals.append("arXiv id")
+    if fields.get("abstract"):
+        signals.append("abstract")
+    if _REFERENCES_RE.search(text):
+        signals.append("references")
+    if _INTRO_RE.search(text):
+        signals.append("paper sections")
+    if len(_CITATION_RE.findall(text)) >= 3:
+        signals.append("numbered citations")
+    marker = _REPUTABLE_RE.search(text)
+    if marker:
+        signals.append(f"source '{marker.group(0).lower()}'")
+
+    is_scholarly = len(signals) >= max(1, SCHOLARLY_MIN_SIGNALS)
+    reason = ", ".join(signals) if signals else "no scholarly markers found"
+    return is_scholarly, reason
+
+
 def _extract_fields(pdf_path: str) -> dict[str, str]:
     """
     Extract structured fields from a research paper PDF. Returns a dict with:
@@ -253,7 +315,7 @@ def _extract_fields(pdf_path: str) -> dict[str, str]:
     doi_match = DOI_RE.search(combined_front)
     arxiv_match = ARXIV_RE.search(combined_front)
 
-    return {
+    fields: dict[str, object] = {
         "title": _clean(title)[:300],
         "authors": _clean(authors)[:300],
         "year": year,
@@ -264,6 +326,10 @@ def _extract_fields(pdf_path: str) -> dict[str, str]:
         "doi": doi_match.group(0)[:200] if doi_match else "",
         "arxiv_id": arxiv_match.group(1)[:50] if arxiv_match else "",
     }
+    is_scholarly, reason = classify_document(fields)
+    fields["is_scholarly"] = 1 if is_scholarly else 0
+    fields["doc_reason"] = reason[:200]
+    return fields
 
 
 def _guess_title(page0: str) -> str:
@@ -348,6 +414,8 @@ CREATE TABLE IF NOT EXISTS papers (
     preview     TEXT    DEFAULT '',   -- short slice of the body; display only
     doi         TEXT    DEFAULT '',
     arxiv_id    TEXT    DEFAULT '',
+    is_scholarly INTEGER DEFAULT 1,   -- 1 = genuine paper/report, 0 = discarded
+    doc_reason  TEXT    DEFAULT '',   -- why it was (not) classified as scholarly
     indexed_at  TEXT    DEFAULT (datetime('now'))
 );
 -- path is already indexed by its UNIQUE constraint; only year needs its own
@@ -406,7 +474,8 @@ FTS5_AVAILABLE = _sqlite_has_fts5()
 
 # Bump when the stored fields change in a way that requires re-extraction.
 # v2 introduced whole-body full-text indexing (previously only ~4k chars).
-INDEX_FORMAT_VERSION = 2
+# v3 added scholarly-document classification (is_scholarly / doc_reason).
+INDEX_FORMAT_VERSION = 3
 
 
 def get_db_path(directory: str) -> str:
@@ -430,8 +499,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(BASE_SCHEMA)
 
     # Add columns introduced after the original release (idempotent for old DBs).
-    if "preview" not in _table_columns(conn, "papers"):
+    existing = _table_columns(conn, "papers")
+    if "preview" not in existing:
         conn.execute("ALTER TABLE papers ADD COLUMN preview TEXT DEFAULT ''")
+    if "is_scholarly" not in existing:
+        conn.execute("ALTER TABLE papers ADD COLUMN is_scholarly INTEGER DEFAULT 1")
+    if "doc_reason" not in existing:
+        conn.execute("ALTER TABLE papers ADD COLUMN doc_reason TEXT DEFAULT ''")
 
     # One-time re-index when the extraction format changes (e.g. whole-body FTS).
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -479,9 +553,11 @@ def upsert_paper(
     conn.execute(
         """
         INSERT INTO papers (path, mtime, size, filename, title, authors, year,
-                            abstract, keywords, fulltext, preview, doi, arxiv_id, indexed_at)
+                            abstract, keywords, fulltext, preview, doi, arxiv_id,
+                            is_scholarly, doc_reason, indexed_at)
         VALUES (:path, :mtime, :size, :filename, :title, :authors, :year,
-                :abstract, :keywords, :fulltext, :preview, :doi, :arxiv_id, datetime('now'))
+                :abstract, :keywords, :fulltext, :preview, :doi, :arxiv_id,
+                :is_scholarly, :doc_reason, datetime('now'))
         ON CONFLICT(path) DO UPDATE SET
             mtime = excluded.mtime,
             size = excluded.size,
@@ -495,6 +571,8 @@ def upsert_paper(
             preview = excluded.preview,
             doi = excluded.doi,
             arxiv_id = excluded.arxiv_id,
+            is_scholarly = excluded.is_scholarly,
+            doc_reason = excluded.doc_reason,
             indexed_at = excluded.indexed_at
         """,
         {
@@ -502,6 +580,10 @@ def upsert_paper(
             "mtime": mtime,
             "size": size,
             "filename": os.path.basename(path),
+            # Callers that seed rows directly (not via extraction) default to
+            # scholarly so they are not silently hidden from search.
+            "is_scholarly": int(fields.get("is_scholarly", 1)),
+            "doc_reason": str(fields.get("doc_reason", "")),
             **{
                 key: fields.get(key, "")
                 for key in ("title", "authors", "year", "abstract", "keywords",
@@ -517,6 +599,14 @@ def remove_missing(conn: sqlite3.Connection, existing_paths: set[str]) -> None:
     if not missing_paths:
         return
     conn.executemany("DELETE FROM papers WHERE path = ?", ((path,) for path in missing_paths))
+
+
+def count_nonscholarly(conn: sqlite3.Connection) -> int:
+    """How many indexed documents were classified as non-papers (discarded)."""
+    try:
+        return conn.execute("SELECT COUNT(*) FROM papers WHERE is_scholarly = 0").fetchone()[0]
+    except sqlite3.Error:
+        return 0
 
 
 def iter_pdf_files(directory: str) -> list[Path]:
@@ -718,6 +808,8 @@ def _fetch_candidate_rows(
                 if year_filter:
                     sql += " AND papers.year = ?"
                     params.append(year_filter)
+                if REQUIRE_SCHOLARLY:
+                    sql += " AND papers.is_scholarly = 1"
                 # One weight per FTS column, in declared order:
                 # title, authors, year, abstract, keywords, fulltext.
                 sql += " ORDER BY bm25(papers_fts, 5.0, 2.0, 1.0, 3.0, 4.0, 1.0) LIMIT ?"
@@ -733,6 +825,8 @@ def _fetch_candidate_rows(
     if year_filter:
         where_clauses.append("year = ?")
         params.append(year_filter)
+    if REQUIRE_SCHOLARLY:
+        where_clauses.append("is_scholarly = 1")
 
     term_clauses: list[str] = []
     for term in terms:
@@ -804,25 +898,6 @@ def search(
     return output
 
 
-def make_snippet(text: str, terms: list[str], length: int = SNIPPET_LEN) -> str:
-    """Return the most relevant window of text for display."""
-    if not text:
-        return ""
-    lower = text.lower()
-    best_pos = 0
-    for term in terms:
-        index = lower.find(term.lower())
-        if index != -1:
-            best_pos = max(0, index - 60)
-            break
-    snippet = text[best_pos : best_pos + length]
-    if best_pos > 0:
-        snippet = "..." + snippet
-    if best_pos + length < len(text):
-        snippet += "..."
-    return snippet
-
-
 # -----------------------------------------------------------------------------
 # EXACT-MATCH AGGREGATION
 #
@@ -842,6 +917,8 @@ class AggregateStats(NamedTuple):
     candidates: int
     matched: int
     copied: int
+    skipped_existing: int   # identical paper already present in the destination
+    skipped_nonpaper: int   # matched keywords but discarded as a non-scholarly doc
     errors: int
     cancelled: bool
     dest_dir: str
@@ -888,7 +965,8 @@ def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlit
     huge collections; the caller still verifies each hit exactly. Falls back to a
     full scan when FTS5 is unavailable (correctness is unaffected either way).
     """
-    columns = ", ".join(f"papers.{field}" for field in MATCH_FIELDS)
+    fields = ", ".join(f"papers.{field}" for field in MATCH_FIELDS)
+    columns = f"{fields}, papers.path, papers.is_scholarly"
     if FTS5_AVAILABLE:
         phrases = []
         for keyword in keywords:
@@ -899,7 +977,7 @@ def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlit
             match_query = " AND ".join(phrases)
             try:
                 sql = (
-                    f"SELECT {columns}, papers.path FROM papers_fts "
+                    f"SELECT {columns} FROM papers_fts "
                     "JOIN papers ON papers.id = papers_fts.rowid "
                     "WHERE papers_fts MATCH ?"
                 )
@@ -907,34 +985,84 @@ def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlit
             except sqlite3.OperationalError:
                 LOGGER.warning("Aggregation FTS query failed; scanning all rows.", exc_info=True)
 
-    return conn.execute(f"SELECT {columns}, path FROM papers").fetchall()
+    plain = ", ".join(MATCH_FIELDS)
+    return conn.execute(f"SELECT {plain}, path, is_scholarly FROM papers").fetchall()
 
 
-def _copy_into(paths: list[str], dest_dir: str) -> tuple[int, int]:
-    """Copy files into dest_dir, de-duplicating colliding names. Returns (copied, errors)."""
+def _hash_file(path: str, chunk: int = 1 << 20) -> str:
+    """Content hash used to recognise a paper already present in the destination."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(chunk), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _copy_into(paths: list[str], dest_dir: str) -> tuple[int, int, int]:
+    """
+    Copy files into ``dest_dir``, skipping any paper whose content is already
+    there (identical bytes), and de-duplicating merely-colliding names. Existing
+    files are hashed lazily and only when a source shares their size, so the
+    identity check stays cheap. Returns ``(copied, errors, skipped_existing)``.
+    """
     os.makedirs(dest_dir, exist_ok=True)
-    copied = errors = 0
-    used: set[str] = set()
+
+    dest_by_size: dict[int, list[str]] = {}
+    existing_names: set[str] = set()
+    for entry in os.scandir(dest_dir):
+        if entry.is_file():
+            existing_names.add(entry.name)
+            with suppress(OSError):
+                dest_by_size.setdefault(entry.stat().st_size, []).append(entry.path)
+
+    present_hashes: dict[int, set[str]] = {}
+    hashed_sizes: set[int] = set()
+
+    def hashes_for(size: int) -> set[str]:
+        bucket = present_hashes.setdefault(size, set())
+        if size not in hashed_sizes:  # hash same-size dest files once, on demand
+            for existing in dest_by_size.get(size, []):
+                with suppress(OSError):
+                    bucket.add(_hash_file(existing))
+            hashed_sizes.add(size)
+        return bucket
+
+    copied = errors = skipped_existing = 0
     for path in paths:
         try:
-            base = os.path.basename(path)
-            target = os.path.join(dest_dir, base)
-            if target in used or os.path.exists(target):
-                stem, ext = os.path.splitext(base)
-                counter = 1
-                while True:
-                    candidate = os.path.join(dest_dir, f"{stem} ({counter}){ext}")
-                    if candidate not in used and not os.path.exists(candidate):
-                        target = candidate
-                        break
-                    counter += 1
+            size = os.path.getsize(path)
+            digest = _hash_file(path)
+        except OSError as exc:
+            errors += 1
+            LOGGER.warning("Could not read %s: %s", path, exc)
+            continue
+
+        if digest in hashes_for(size):
+            skipped_existing += 1
+            continue
+
+        base = os.path.basename(path)
+        target = os.path.join(dest_dir, base)
+        if base in existing_names or os.path.exists(target):
+            stem, ext = os.path.splitext(base)
+            counter = 1
+            while True:
+                candidate_name = f"{stem} ({counter}){ext}"
+                candidate = os.path.join(dest_dir, candidate_name)
+                if candidate_name not in existing_names and not os.path.exists(candidate):
+                    base, target = candidate_name, candidate
+                    break
+                counter += 1
+        try:
             shutil.copy2(path, target)
-            used.add(target)
-            copied += 1
         except OSError as exc:
             errors += 1
             LOGGER.warning("Could not copy %s: %s", path, exc)
-    return copied, errors
+            continue
+        copied += 1
+        existing_names.add(base)
+        present_hashes.setdefault(size, set()).add(digest)  # catch within-run dupes
+    return copied, errors, skipped_existing
 
 
 def aggregate_matches(
@@ -957,7 +1085,7 @@ def aggregate_matches(
 
     patterns = compile_keyword_patterns(keywords, match_case)
     if not patterns:
-        return AggregateStats(0, 0, 0, 0, 0, False, dest_dir)
+        return AggregateStats(0, 0, 0, 0, 0, 0, 0, False, dest_dir)
 
     db_path = get_db_path(source_dir)
     index_stats = index_directory(
@@ -968,33 +1096,45 @@ def aggregate_matches(
         should_cancel=should_cancel,
     )
     if index_stats.cancelled:
-        return AggregateStats(index_stats.total, 0, 0, 0, index_stats.errors, True, dest_dir)
+        return AggregateStats(index_stats.total, 0, 0, 0, 0, 0, index_stats.errors, True, dest_dir)
 
     dest_prefix = os.path.abspath(dest_dir) + os.sep
     conn = open_db(db_path)
+    matched: list[str] = []
+    skipped_nonpaper = 0
+    cancelled = False
     try:
         rows = _candidate_rows(conn, keywords)
         candidates = len(rows)
-        matched: list[str] = []
         for position, row in enumerate(rows, start=1):
             if cancel():
-                return AggregateStats(index_stats.total, candidates, len(matched), 0,
-                                      index_stats.errors, True, dest_dir)
+                cancelled = True
+                break
             report("match", position, candidates, "")
             path = row["path"]
             # Never re-collect files already sitting in the destination folder.
             if os.path.abspath(path).startswith(dest_prefix):
                 continue
             if paper_matches(row, patterns):
-                matched.append(path)
+                # Only genuine papers/reports are collected; the rest are counted
+                # so the user can be told they were excluded.
+                if REQUIRE_SCHOLARLY and not row["is_scholarly"]:
+                    skipped_nonpaper += 1
+                else:
+                    matched.append(path)
     finally:
         with suppress(sqlite3.Error):
             conn.close()
 
-    copied, copy_errors = _copy_into(matched, dest_dir)
+    if cancelled:
+        return AggregateStats(index_stats.total, candidates, len(matched), 0,
+                              0, skipped_nonpaper, index_stats.errors, True, dest_dir)
+
+    copied, copy_errors, skipped_existing = _copy_into(matched, dest_dir)
     return AggregateStats(
         index_stats.total, candidates, len(matched), copied,
-        index_stats.errors + copy_errors, False, dest_dir,
+        skipped_existing, skipped_nonpaper, index_stats.errors + copy_errors,
+        False, dest_dir,
     )
 
 
@@ -1103,7 +1243,7 @@ class ScrollableFrame(tk.Frame):
 class ResultCard(tk.Frame):
     """A single result card widget."""
 
-    def __init__(self, parent, result: dict, terms: list[str], on_open, on_reveal, **kwargs):
+    def __init__(self, parent, result: dict, on_open, on_reveal, **kwargs):
         super().__init__(
             parent,
             bg=THEME["card"],
@@ -1115,12 +1255,12 @@ class ResultCard(tk.Frame):
         self.result = result
         self.on_open = on_open
         self.on_reveal = on_reveal
-        self._build(result, terms)
+        self._build(result)
         self.bind("<Enter>", self._hover_on, add="+")
         self.bind("<Leave>", self._hover_off, add="+")
         self.bind("<Double-Button-1>", lambda _event: on_open(result["path"]), add="+")
 
-    def _build(self, result: dict, terms: list[str]) -> None:
+    def _build(self, result: dict) -> None:
         top = tk.Frame(self, bg=THEME["card"])
         top.pack(fill="x", padx=12, pady=(10, 4))
 
@@ -1212,7 +1352,7 @@ class ResultCard(tk.Frame):
         if keywords:
             keywords_frame = tk.Frame(self, bg=THEME["card"])
             keywords_frame.pack(fill="x", padx=12, pady=(0, 6))
-            for chip in re.split(r"[;,·]", keywords)[:8]:
+            for chip in re.split(r"[;,·]", keywords)[:6]:
                 chip = chip.strip()
                 if chip:
                     tk.Label(
@@ -1226,22 +1366,38 @@ class ResultCard(tk.Frame):
                         relief="flat",
                     ).pack(side="left", padx=2)
 
-        snippet_source = result.get("abstract") or result.get("preview", "")
-        snippet = make_snippet(snippet_source, terms)
-        if snippet:
-            tk.Label(
+        # Abstract is collapsed by default to keep the list scannable; the full
+        # text (not a truncated snippet) expands on demand.
+        self._abstract_expanded = False
+        self._abstract_toggle = None
+        self._abstract_body = None
+        abstract = (result.get("abstract") or "").strip()
+        if abstract:
+            self._abstract_toggle = tk.Label(
                 self,
-                text=snippet,
+                text="▸ Show abstract",
+                bg=THEME["card"],
+                fg=THEME["accent2"],
+                font=THEME["font_small"],
+                cursor="hand2",
+                anchor="w",
+            )
+            self._abstract_toggle.pack(fill="x", padx=12, pady=(0, 6))
+            self._abstract_toggle.bind("<Button-1>", lambda _e: self._toggle_abstract(), add="+")
+            self._abstract_body = tk.Label(
+                self,
+                text=abstract,
                 bg=THEME["card"],
                 fg=THEME["subtext"],
                 font=THEME["font_small"],
                 wraplength=720,
                 justify="left",
                 anchor="w",
-            ).pack(fill="x", padx=12, pady=(0, 6))
+            )  # packed only when expanded
 
         footer = tk.Frame(self, bg=THEME["card"])
         footer.pack(fill="x", padx=12, pady=(0, 10))
+        self._footer = footer
 
         path_label = tk.Label(
             footer,
@@ -1267,6 +1423,18 @@ class ResultCard(tk.Frame):
         for widget in self.winfo_children():
             widget.bind("<Enter>", self._hover_on, add="+")
             widget.bind("<Leave>", self._hover_off, add="+")
+
+    def _toggle_abstract(self) -> None:
+        if not self._abstract_body:
+            return
+        self._abstract_expanded = not self._abstract_expanded
+        if self._abstract_expanded:
+            self._abstract_body.configure(bg=self.cget("bg"))  # match current hover state
+            self._abstract_body.pack(fill="x", padx=12, pady=(0, 8), before=self._footer)
+            self._abstract_toggle.configure(text="▾ Hide abstract")
+        else:
+            self._abstract_body.pack_forget()
+            self._abstract_toggle.configure(text="▸ Show abstract")
 
     def _set_background_recursive(self, widget: tk.Widget, color: str) -> None:
         with suppress(tk.TclError):
@@ -1459,20 +1627,34 @@ class CollectDialog(tk.Toplevel):
         if stats.cancelled:
             self._set_status("Cancelled.", color=THEME["highlight"])
             return
-        summary = (
-            f"Scanned {stats.total_indexed} papers, {stats.candidates} candidates, "
-            f"{stats.matched} exact matches, {stats.copied} copied."
-        )
-        if stats.errors:
-            summary += f" {stats.errors} errors."
-        self._set_status(summary, color=THEME["green"] if stats.copied else THEME["subtext"])
+
+        lines: list[str] = []
         if stats.copied:
-            open_it = messagebox.askyesno(
-                "Collect complete",
-                f"{summary}\n\nOpen the destination folder?",
-                parent=self,
-            )
-            if open_it:
+            lines.append(f"Copied {stats.copied} paper(s) to the destination.")
+        if stats.matched == 0:
+            lines.append("No papers exactly matched all keywords.")
+        if stats.skipped_existing:
+            lines.append(f"{stats.skipped_existing} already in the folder — skipped (not re-copied).")
+        if stats.skipped_nonpaper:
+            lines.append(f"{stats.skipped_nonpaper} matched but were discarded as non-papers.")
+        if stats.errors:
+            lines.append(f"{stats.errors} error(s) — see logs.")
+
+        color = (
+            THEME["green"] if stats.copied
+            else THEME["highlight"] if (stats.skipped_existing or stats.skipped_nonpaper)
+            else THEME["subtext"]
+        )
+        self._set_status("  ".join(lines) or "Done.", color=color)
+
+        detail = "\n".join(lines) + (
+            f"\n\nScanned {stats.total_indexed} document(s); "
+            f"{stats.candidates} keyword candidate(s)."
+        )
+        if stats.copied:
+            if messagebox.askyesno(
+                "Collect complete", detail + "\n\nOpen the destination folder?", parent=self
+            ):
                 with suppress(Exception):
                     if sys.platform == "win32":
                         os.startfile(stats.dest_dir)
@@ -1480,8 +1662,8 @@ class CollectDialog(tk.Toplevel):
                         subprocess.Popen(["open", stats.dest_dir])
                     else:
                         subprocess.Popen(["xdg-open", stats.dest_dir])
-        elif stats.matched == 0:
-            messagebox.showinfo("Collect complete", summary, parent=self)
+        else:
+            messagebox.showinfo("Collect complete", detail, parent=self)
 
     def _on_close(self) -> None:
         if self._running:
@@ -1878,7 +2060,13 @@ class App(tk.Tk):
             message = f"{stats.total} PDFs total, {stats.indexed} indexed, {stats.skipped} cached"
             if stats.errors:
                 message += f", {stats.errors} errors"
-            self._set_status(message, color=THEME["highlight"] if stats.errors else THEME["subtext"])
+            discarded = 0
+            if REQUIRE_SCHOLARLY and self._search_conn:
+                discarded = count_nonscholarly(self._search_conn)
+            if discarded:
+                message += f" — {discarded} non-paper doc(s) hidden"
+            has_note = bool(stats.errors or discarded)
+            self._set_status(message, color=THEME["highlight"] if has_note else THEME["subtext"])
             if stats.errors and stats.error_samples:
                 details = "\n".join(stats.error_samples)
                 LOGGER.warning("Indexing completed with errors:\n%s", details)
@@ -1915,9 +2103,8 @@ class App(tk.Tk):
             return
 
         try:
-            terms = _split_terms(query)
             results = search(self._search_conn, query, year_filter=year)
-            self._render_results(results, terms)
+            self._render_results(results)
         except sqlite3.Error as exc:
             self._set_status("Search failed. Please try reloading the directory.", color=THEME["red"])
             LOGGER.exception("Search failed: %s", exc)
@@ -1947,7 +2134,7 @@ class App(tk.Tk):
         self._placeholder.pack(expand=True, pady=70)
         self._results_label.config(text="")
 
-    def _render_results(self, results: list[dict], terms: list[str]) -> None:
+    def _render_results(self, results: list[dict]) -> None:
         self._cancel_render()
         for widget in self._cards_frame.winfo_children():
             widget.destroy()
@@ -1969,9 +2156,9 @@ class App(tk.Tk):
         )
         # Build cards a few at a time, yielding to the event loop between batches,
         # so the search box stays responsive while typing (Tk is single-threaded).
-        self._render_batch(self._render_token, results, terms, 0)
+        self._render_batch(self._render_token, results, 0)
 
-    def _render_batch(self, token: int, results: list[dict], terms: list[str], start: int) -> None:
+    def _render_batch(self, token: int, results: list[dict], start: int) -> None:
         if token != self._render_token or self._closing:
             return
         end = min(start + RENDER_BATCH_SIZE, len(results))
@@ -1979,13 +2166,12 @@ class App(tk.Tk):
             card = ResultCard(
                 self._cards_frame,
                 results[index],
-                terms,
                 on_open=self._open_pdf,
                 on_reveal=self._reveal_in_explorer,
             )
             card.pack(fill="x", padx=8, pady=4)
         if end < len(results):
-            self._render_after_id = self.after(1, self._render_batch, token, results, terms, end)
+            self._render_after_id = self.after(1, self._render_batch, token, results, end)
         else:
             self._render_after_id = None
 
@@ -2047,6 +2233,15 @@ def _run_headless_index(directory: str, force: bool, workers: Optional[int]) -> 
         f"{stats.total} PDFs total, {stats.indexed} indexed, "
         f"{stats.skipped} cached, {stats.errors} errors"
     )
+    if REQUIRE_SCHOLARLY:
+        with suppress(sqlite3.Error):
+            conn = open_db(get_db_path(directory))
+            try:
+                discarded = count_nonscholarly(conn)
+            finally:
+                conn.close()
+            if discarded:
+                print(f"  {discarded} document(s) excluded as non-papers.")
     for sample in stats.error_samples:
         print(f"  ! {sample}", file=sys.stderr)
     return 1 if stats.errors else 0
@@ -2074,10 +2269,15 @@ def _run_headless_collect(
     )
     print(file=sys.stderr)
     print(
-        f"{stats.total_indexed} papers scanned, {stats.candidates} candidates, "
-        f"{stats.matched} exact matches, {stats.copied} copied to {stats.dest_dir}"
-        + (f", {stats.errors} errors" if stats.errors else "")
+        f"{stats.total_indexed} documents scanned, {stats.matched} exact match(es), "
+        f"{stats.copied} copied to {stats.dest_dir}"
     )
+    if stats.skipped_existing:
+        print(f"  {stats.skipped_existing} already present in destination - skipped.")
+    if stats.skipped_nonpaper:
+        print(f"  {stats.skipped_nonpaper} matched but discarded as non-papers.")
+    if stats.errors:
+        print(f"  {stats.errors} error(s).")
     return 1 if stats.errors else 0
 
 
