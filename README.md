@@ -16,6 +16,8 @@ so re‑opening a large library is near‑instant.
 
 - **Content search** across title / authors / year / abstract / keywords / full text
   with per‑field relevance weighting (BM25 when FTS5 is present).
+- **Year filtering by range** — narrow results to a single year (`2024`) or a
+  range (`2020-2025`, `2020-` for onward, `-2019` up to a year).
 - **Whole‑document full‑text search** — the entire body of each paper is indexed,
   so you can find a concept that appears anywhere (methods, results, discussion),
   not just in the title or abstract.
@@ -59,9 +61,11 @@ pip install -r requirements.txt
 ```bash
 python research_paper_search.py
 ```
-Choose a folder, wait for the one‑time index to build, then type to search.
-Double‑click a result (or **Open PDF**) to open it; **Reveal** shows it in your
-file manager.
+Choose a folder, wait for the one‑time index to build, then type to search. Use
+the **Years** box to filter by a single year or a range (`2024`, `2020-2025`,
+`2020-`, `-2019`). Result cards stay compact — click **Show abstract** to expand
+the full abstract for any result. Double‑click a result (or **Open PDF**) to open
+it; **Reveal** shows it in your file manager.
 
 ### Headless indexing (admin/one‑off process)
 Pre‑build or refresh the cache without opening a window — handy for large

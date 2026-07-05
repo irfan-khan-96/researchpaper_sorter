@@ -786,10 +786,43 @@ def _fuzzy_score(query: str, text: str) -> float:
     return difflib.SequenceMatcher(None, query.lower(), text.lower()).ratio() * 100
 
 
+YEAR_BOUND_MIN, YEAR_BOUND_MAX = 1000, 9999
+
+
+def _year_int(text: str, default: Optional[int]) -> Optional[int]:
+    text = text.strip()
+    if not text:
+        return default
+    return int(text) if text.isdigit() else None
+
+
+def parse_year_range(raw: Optional[str]) -> Optional[tuple[int, int]]:
+    """
+    Parse a year filter into an inclusive ``(low, high)`` range, or ``None``.
+
+    Accepts a single year (``"2024"``), an explicit range (``"2024-2025"``), or an
+    open-ended range (``"2020-"`` for 2020 onward, ``"-2019"`` up to 2019).
+    ``-``, en/em dashes, ``..`` and ``to`` all work as separators. Invalid input
+    yields ``None`` (no year filter) rather than raising.
+    """
+    if not raw:
+        return None
+    text = re.sub(r"\s*(?:–|—|\.\.|to)\s*", "-", raw.strip(), flags=re.IGNORECASE)
+    if "-" in text:
+        low_text, _, high_text = text.partition("-")
+        low = _year_int(low_text, YEAR_BOUND_MIN)
+        high = _year_int(high_text, YEAR_BOUND_MAX)
+    else:
+        low = high = _year_int(text, None)
+    if low is None or high is None:
+        return None
+    return (low, high) if low <= high else (high, low)
+
+
 def _fetch_candidate_rows(
     conn: sqlite3.Connection,
     terms: list[str],
-    year_filter: Optional[str],
+    year_range: Optional[tuple[int, int]],
     top_n: int,
 ) -> list[sqlite3.Row]:
     limit = max(SEARCH_CANDIDATE_LIMIT, top_n * 10)
@@ -805,9 +838,9 @@ def _fetch_candidate_rows(
                     WHERE papers_fts MATCH ?
                 """
                 params: list[object] = [fts_query]
-                if year_filter:
-                    sql += " AND papers.year = ?"
-                    params.append(year_filter)
+                if year_range:
+                    sql += " AND CAST(papers.year AS INTEGER) BETWEEN ? AND ?"
+                    params.extend(year_range)
                 if REQUIRE_SCHOLARLY:
                     sql += " AND papers.is_scholarly = 1"
                 # One weight per FTS column, in declared order:
@@ -822,9 +855,9 @@ def _fetch_candidate_rows(
 
     where_clauses: list[str] = []
     params: list[object] = []
-    if year_filter:
-        where_clauses.append("year = ?")
-        params.append(year_filter)
+    if year_range:
+        where_clauses.append("CAST(year AS INTEGER) BETWEEN ? AND ?")
+        params.extend(year_range)
     if REQUIRE_SCHOLARLY:
         where_clauses.append("is_scholarly = 1")
 
@@ -870,15 +903,20 @@ def score_paper(terms: list[str], row: sqlite3.Row) -> float:
 def search(
     conn: sqlite3.Connection,
     query: str,
-    year_filter: Optional[str] = None,
+    year_filter=None,
     top_n: int = 30,
 ) -> list[dict[str, object]]:
-    """Search indexed papers and return sorted result dictionaries."""
+    """
+    Search indexed papers and return sorted result dictionaries. ``year_filter``
+    may be a raw string ("2024", "2020-2025", "2020-", "-2019") or a pre-parsed
+    ``(low, high)`` tuple.
+    """
     terms = _split_terms(query)
     if not terms:
         return []
 
-    rows = _fetch_candidate_rows(conn, terms, year_filter, top_n=top_n)
+    year_range = year_filter if isinstance(year_filter, tuple) else parse_year_range(year_filter)
+    rows = _fetch_candidate_rows(conn, terms, year_range, top_n=top_n)
     # Candidates arrive best-first (BM25 for FTS). Keep that as a base score so a
     # paper matched only deep in the body is retained, then let the field-level
     # bonus lift exact title/keyword hits above it.
@@ -1681,6 +1719,7 @@ class App(tk.Tk):
         self.geometry("980x720")
         self.minsize(760, 520)
         self.configure(bg=THEME["bg"])
+        self._set_window_icon()
 
         self._directory = ""
         self._db_path = ""
@@ -1699,6 +1738,12 @@ class App(tk.Tk):
         self._build_ui()
         self._check_deps()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_window_icon(self) -> None:
+        """Apply the embedded icon to the window/taskbar; ignore if unsupported."""
+        with suppress(Exception):
+            self._icon_image = tk.PhotoImage(data="".join(APP_ICON_B64.split()))
+            self.iconphoto(True, self._icon_image)  # True => default for all toplevels
 
     # Styling -----------------------------------------------------------------
 
@@ -1858,7 +1903,7 @@ class App(tk.Tk):
 
         tk.Label(
             search_frame,
-            text="Year",
+            text="Years",
             bg=THEME["bg"],
             fg=THEME["subtext"],
             font=THEME["font_small"],
@@ -1876,14 +1921,14 @@ class App(tk.Tk):
             selectforeground=THEME["text"],
             font=THEME["font_main"],
             bd=0,
-            width=7,
+            width=11,
             highlightthickness=1,
             highlightbackground=THEME["border"],
             highlightcolor=THEME["accent"],
         )
         year_entry.pack(side="left", ipady=6, padx=(0, 8))
         year_entry.bind("<Return>", lambda _event: self._do_search(), add="+")
-        Tooltip(year_entry, "Filter by year, for example 2024")
+        Tooltip(year_entry, "Filter by year or range, e.g. 2024, 2020-2025, 2020- or -2019")
 
         self._results_label = tk.Label(
             self,
@@ -2337,6 +2382,59 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     App().mainloop()
     return 0
+
+
+# -----------------------------------------------------------------------------
+# APP ICON — 128x128 PNG (base64), embedded so the tool stays a single file.
+# -----------------------------------------------------------------------------
+APP_ICON_B64 = (
+    "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"
+)
 
 
 if __name__ == "__main__":
