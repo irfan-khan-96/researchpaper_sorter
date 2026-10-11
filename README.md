@@ -33,8 +33,8 @@ so re‑opening a large library is near‑instant.
   time changed.
 - **Parallel extraction** — PDF text extraction is fanned out across CPU cores,
   so first‑time indexing of a large library is dramatically faster.
-- **Graceful degradation** — works with the standard library alone; optional
-  `pdfplumber` / `rapidfuzz` make it faster and more accurate.
+- **Fast PDF reading** — text is extracted with pdfium (the engine behind Chrome's
+  PDF viewer), roughly 40× faster than pure‑Python readers; pypdf is the fallback.
 - **Two entry points** — a Tkinter desktop UI, and a headless `--index` command
   for building the cache from scripts or a scheduled job.
 
@@ -43,9 +43,9 @@ so re‑opening a large library is near‑instant.
 ## Requirements
 
 - **Python 3.9+** (developed/tested on 3.14).
-- Dependencies in [`requirements.txt`](requirements.txt). All are optional
-  accelerators except that *at least one* PDF backend (`pdfplumber` or `pypdf`)
-  is needed to read PDFs; installing everything is recommended.
+- Dependencies in [`requirements.txt`](requirements.txt): `pypdfium2` (primary
+  PDF reader), `pypdf` (fallback), `rapidfuzz` (fuzzy scoring). At least one PDF
+  reader is required; installing everything is recommended.
 - Tkinter for the GUI (bundled with CPython on Windows/macOS; on Debian/Ubuntu:
   `sudo apt install python3-tk`).
 
@@ -118,7 +118,7 @@ defaults — nothing is hard‑coded. Override any of these before launching:
 | `RPS_INDEX_WORKERS` | `0` | Extraction worker processes (`0` = auto‑detect CPUs, capped at 8) |
 | `RPS_RENDER_BATCH` | `4` | Result cards drawn per UI tick (keeps the search box responsive) |
 | `RPS_REQUIRE_SCHOLARLY` | `1` | Surface only papers/reports; set `0` to index every PDF |
-| `RPS_SCHOLARLY_MIN_SIGNALS` | `2` | Scholarly signals a doc needs to be kept (lower = more permissive) |
+| `RPS_SCHOLARLY_MIN_SCORE` | `2` | Scholarly score a doc needs to be kept (strong signals score 2, supporting 1; lower = more permissive) |
 | `RPS_LOG_LEVEL` | `WARNING` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 
 Example (PowerShell):
@@ -139,9 +139,15 @@ as you would any other process output.
    text** (in parallel worker processes). Text is normalised so it matches the
    way it reads: ligatures are expanded ("ﬁ" → "fi"), hyphen variants unified,
    and words split across line breaks rejoined ("learn‑/ing" → "learning").
-3. **Classify** each document from scholarly signals (DOI, arXiv id, abstract,
-   references, reputable publisher/institution names, numbered citations). Genuine
-   papers/reports are kept; the rest are flagged and hidden from results.
+   Titles come from the PDF's metadata when it is printed on page 1, otherwise
+   from the largest text on page 1; the year comes from the arXiv stamp,
+   publication/copyright lines or proceedings headers before any other number.
+3. **Classify** each document: strong evidence (DOI, arXiv id, a References
+   heading) and supporting evidence (abstract, section headings, citations,
+   reputable publisher/venue/institution) are scored. Genuine papers/reports are
+   kept; the rest are hidden from results. PDFs with no extractable text
+   (scanned or damaged) are reported separately so they can be OCR'd, never
+   silently treated as "no match".
 4. **Store** them in SQLite; an FTS5 virtual table + triggers keep a whole‑document
    full‑text index in sync. Only a short `preview` of the body is kept in the base
    table for the re‑rank pass, so search stays fast.

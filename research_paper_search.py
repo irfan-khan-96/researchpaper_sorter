@@ -15,6 +15,7 @@ written to stderr. Nothing operational is hard-coded into the source.
 """
 
 import argparse
+import datetime
 import hashlib
 import logging
 import os
@@ -32,13 +33,24 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, NamedTuple, Optional
 
-# Optional fast path: pdfplumber for text, rapidfuzz for fuzzy scoring
+# PDF text backends, fastest first: pdfium (C++, Chrome's PDF engine) is the
+# primary reader; pdfplumber and pypdf (pure Python) are fallbacks.
+try:
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_raw
+
+    PDFIUM_OK = True
+except ImportError:
+    PDFIUM_OK = False
+
 try:
     import pdfplumber
 
     PDFPLUMBER_OK = True
 except ImportError:
     PDFPLUMBER_OK = False
+
+# Optional: rapidfuzz for fast fuzzy scoring (difflib fallback).
 
 try:
     from rapidfuzz import fuzz
@@ -100,8 +112,12 @@ INDEX_WORKERS = _env_int("RPS_INDEX_WORKERS", 0)  # 0 = auto (detect CPU count)
 RENDER_BATCH_SIZE = _env_int("RPS_RENDER_BATCH", 4)
 # Only surface genuine research papers / institutional reports; discard the rest.
 REQUIRE_SCHOLARLY = os.environ.get("RPS_REQUIRE_SCHOLARLY", "1") not in ("0", "false", "False", "")
-# How many scholarly signals a document needs to be treated as a paper/report.
-SCHOLARLY_MIN_SIGNALS = _env_int("RPS_SCHOLARLY_MIN_SIGNALS", 2)
+# Score a document needs to count as a paper/report (strong signals such as a
+# DOI or a references section score 2, supporting signals score 1).
+SCHOLARLY_MIN_SCORE = _env_int("RPS_SCHOLARLY_MIN_SCORE", 2)
+# Below this much extracted text a PDF is treated as having no text layer
+# (scanned image or damaged file) rather than judged as a non-paper.
+MIN_TEXT_CHARS = 200
 
 # Weights for the Python re-ranking pass. It runs only over the small,
 # high-signal fields loaded per candidate; the full body is ranked by BM25 in
@@ -127,7 +143,6 @@ _ROW_SELECT = ", ".join(RESULT_COLUMNS)
 # the degraded path can still find body matches.
 SEARCH_FIELDS = ("title", "keywords", "abstract", "authors", "fulltext")
 
-YEAR_RE = re.compile(r"\b(19[5-9]\d|20[0-4]\d)\b")
 ARXIV_RE = re.compile(r"arxiv[:\s]*(\d{4}\.\d{4,5})", re.IGNORECASE)
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"<>]+", re.IGNORECASE)
 
@@ -194,7 +209,10 @@ def _accumulate_pages(
     unlimited = char_limit <= 0
 
     for page_index, text in enumerate(page_texts):
-        text = normalize_text(text)
+        # Unify line endings, and turn pdfium's soft-hyphen line-break markers
+        # back into "-\n" so _dehyphenate decides how to rejoin the word.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = normalize_text(text.replace("￾", "-\n").replace("\x02", "-\n"))
         want_more = unlimited or collected < char_limit
         if page_index >= max_front_pages and not want_more:
             break
@@ -215,135 +233,322 @@ def _accumulate_pages(
     return [_dehyphenate(page, vocabulary) for page in front_pages], _dehyphenate(body, vocabulary)
 
 
+class ExtractedPDF(NamedTuple):
+    front_pages: list[str]
+    body: str
+    meta_title: str = ""
+    meta_year: Optional[int] = None
+    font_title: str = ""
+
+
+# pdfium is not thread-safe within one process. Worker processes each have their
+# own copy, so this only serialises in-process (serial or GUI-thread) extraction.
+_PDFIUM_LOCK = threading.Lock()
+
+_TITLE_SKIP_RE = re.compile(
+    r"^(https?://|www\.|©|\(c\)|copyright|doi\b|issn|vol\.|volume\b|arxiv|preprint|"
+    r"received|accepted|published|journal of|proceedings|transactions on|e-?mail|"
+    r"abstract$|keywords?$)",
+    re.IGNORECASE,
+)
+_META_YEAR_RE = re.compile(r"(?<!\d)((?:19[5-9]|20\d)\d)(?!\d)")
+
+
+def _looks_like_title(text: str) -> bool:
+    if not 8 <= len(text) <= 300 or len(text.split()) < 2:
+        return False
+    if _TITLE_SKIP_RE.match(text):
+        return False
+    letters = sum(char.isalpha() or char.isspace() for char in text)
+    return letters / len(text) > 0.6
+
+
+def _as_text(value) -> str:
+    """Metadata values arrive as str, bytes or PDF objects depending on backend."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        for encoding in ("utf-16", "utf-8", "latin-1"):
+            with suppress(UnicodeDecodeError):
+                return value.decode(encoding)
+    return str(value)
+
+
+def _meta_year(value) -> Optional[int]:
+    match = _META_YEAR_RE.search(_as_text(value))
+    return int(match.group(1)) if match else None
+
+
+def _font_size_title(textpage, scan_chars: int = 2500) -> str:
+    """
+    The title is normally the largest text near the top of page 1. Group the
+    first ``scan_chars`` characters into runs of equal font size and return the
+    largest run that reads like a title and is clearly bigger than body text.
+    Margin stamps (e.g. arXiv's) and running headers fail ``_looks_like_title``.
+    """
+    count = min(textpage.count_chars(), scan_chars)
+    raw_page = textpage.raw
+    runs: list[list] = []  # [font size, characters]
+    char_counts: dict[float, int] = {}
+    for index in range(count):
+        char = chr(pdfium_raw.FPDFText_GetUnicode(raw_page, index))
+        if char.isspace() or char in "￾\x02":
+            if runs:
+                runs[-1][1].append(" " if char.isspace() else "-")
+            continue
+        if not char.isprintable():
+            continue
+        size = round(pdfium_raw.FPDFText_GetFontSize(raw_page, index), 1)
+        char_counts[size] = char_counts.get(size, 0) + 1
+        if runs and abs(runs[-1][0] - size) < 0.6:
+            runs[-1][1].append(char)
+        else:
+            runs.append([size, [char]])
+    if not char_counts:
+        return ""
+    body_size = max(char_counts, key=char_counts.get)  # most common size = body text
+    best, best_size = "", 0.0
+    for size, chars in runs:
+        if size < body_size * 1.15 or size <= best_size:
+            continue
+        text = _clean(normalize_text("".join(chars)))
+        if _looks_like_title(text):
+            best, best_size = text, size
+    return best
+
+
+def _read_pdfium(pdf_path: str, max_front_pages: int, char_limit: int) -> ExtractedPDF:
+    with _PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(pdf_path)
+        try:
+            meta: dict = {}
+            with suppress(Exception):
+                meta = pdf.get_metadata_dict()
+            font_title = ""
+
+            def texts():
+                nonlocal font_title
+                for index in range(len(pdf)):
+                    page = textpage = None
+                    try:
+                        page = pdf[index]
+                        textpage = page.get_textpage()
+                        if index == 0:
+                            with suppress(Exception):
+                                font_title = _font_size_title(textpage)
+                        text = textpage.get_text_range()
+                    except pdfium.PdfiumError:
+                        text = ""  # one bad page must not lose the document
+                    finally:
+                        if textpage is not None:
+                            textpage.close()
+                        if page is not None:
+                            page.close()
+                    yield text
+
+            pages = texts()
+            try:
+                front, body = _accumulate_pages(pages, max_front_pages, char_limit)
+            finally:
+                pages.close()
+        finally:
+            pdf.close()
+    return ExtractedPDF(front, body, _as_text(meta.get("Title")),
+                        _meta_year(meta.get("CreationDate")), font_title)
+
+
+def _read_pdfplumber(pdf_path: str, max_front_pages: int, char_limit: int) -> ExtractedPDF:
+    with pdfplumber.open(pdf_path) as pdf:
+        meta = pdf.metadata or {}
+
+        def texts():
+            for page in pdf.pages:
+                try:
+                    yield page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                except Exception:
+                    yield ""
+
+        pages = texts()
+        try:
+            front, body = _accumulate_pages(pages, max_front_pages, char_limit)
+        finally:
+            pages.close()
+    return ExtractedPDF(front, body, _as_text(meta.get("Title")), _meta_year(meta.get("CreationDate")))
+
+
+def _read_pypdf(pdf_path: str, max_front_pages: int, char_limit: int) -> ExtractedPDF:
+    from pypdf import PdfReader
+
+    reader = PdfReader(pdf_path)
+    meta = reader.metadata or {}
+
+    def texts():
+        for page in reader.pages:
+            try:
+                yield page.extract_text() or ""
+            except Exception:
+                yield ""
+
+    front, body = _accumulate_pages(texts(), max_front_pages, char_limit)
+    return ExtractedPDF(front, body, _as_text(meta.get("/Title")), _meta_year(meta.get("/CreationDate")))
+
+
 def _extract_pdf_content(
     pdf_path: str,
     max_front_pages: int = MAX_FRONT_PAGES,
     char_limit: int = FULLTEXT_CHARS,
-) -> tuple[list[str], str]:
+) -> ExtractedPDF:
     """
-    Extract the front pages and the full body text in a single pass, so the whole
-    paper is searchable. Front pages feed structured field extraction; the body
-    (capped at ``char_limit``) is indexed for full-text search.
+    Extract the front pages, the full body text, and PDF metadata in one pass.
+    Backends are tried fastest first (pdfium, then pdfplumber, then pypdf). If a
+    backend opens the file but finds (almost) no text, the next one is tried too,
+    so a font-encoding quirk in one engine does not cost the document.
     """
+    backends = []
+    if PDFIUM_OK:
+        backends.append(("pdfium", _read_pdfium))
     if PDFPLUMBER_OK:
+        backends.append(("pdfplumber", _read_pdfplumber))
+    backends.append(("pypdf", _read_pypdf))
+
+    best: Optional[ExtractedPDF] = None
+    last_error: Optional[Exception] = None
+    for name, read in backends:
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                def texts():
-                    for page in pdf.pages:
-                        try:
-                            yield page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-                        except Exception:
-                            yield ""
-
-                return _accumulate_pages(texts(), max_front_pages, char_limit)
-        except Exception:
-            LOGGER.exception("pdfplumber extraction failed for %s", pdf_path)
-
-    try:
-        from pypdf import PdfReader
-
-        reader = PdfReader(pdf_path)
-
-        def texts():
-            for page in reader.pages:
-                try:
-                    yield page.extract_text() or ""
-                except Exception:
-                    yield ""
-
-        return _accumulate_pages(texts(), max_front_pages, char_limit)
-    except Exception:
-        LOGGER.exception("PDF extraction failed for %s", pdf_path)
-        return [], ""
+            result = read(pdf_path, max_front_pages, char_limit)
+        except Exception as exc:
+            last_error = exc
+            LOGGER.debug("%s could not read %s", name, pdf_path, exc_info=True)
+            continue
+        if len(result.body.strip()) >= MIN_TEXT_CHARS:
+            return result
+        if best is None or len(result.body.strip()) > len(best.body.strip()):
+            best = result
+    if best is not None:
+        return best
+    LOGGER.warning("Could not read %s: %s", pdf_path, last_error)
+    return ExtractedPDF([], "")
 
 
 # -----------------------------------------------------------------------------
 # FIELD EXTRACTION
 # -----------------------------------------------------------------------------
 
-# Names of reputable publishers, databases, and institution types. Presence of
-# any of these (as one of several signals) marks a document as a genuine paper
-# or institutional report rather than an arbitrary PDF.
+# Publishers, indexes, preprint servers, venues and report issuers, matched as
+# whole words only (bare substrings once made "message" count as SAGE and
+# "signature" as Nature). Everyday words (nature, sage, frontiers) and generic
+# letterhead terms (university, institute, department of) are not evidence.
 REPUTABLE_MARKERS = (
-    "doi.org", "arxiv", "biorxiv", "medrxiv", "ssrn", "pubmed", "pmc",
-    "ieee", "acm", "elsevier", "springer", "nature", "wiley", "sciencedirect",
-    "jstor", "taylor & francis", "sage", "oxford university press",
-    "cambridge university press", "plos", "mdpi", "frontiers", "bmj", "aaas",
-    "proceedings of", "journal of", "university", "institute", "laboratory",
-    "national laboratory", "department of", "technical report", "working paper",
-    "world health organization", "nasa", "nist", "cern", "oecd", "unesco",
+    "doi.org", "arxiv", "biorxiv", "medrxiv", "ssrn", "pubmed", "pubmed central",
+    "elsevier", "sciencedirect", "springer", "springer nature", "nature publishing group",
+    "wiley", "ieee", "acm", "jstor", "taylor & francis", "sage publications",
+    "oxford university press", "cambridge university press", "plos", "mdpi", "bmj",
+    "aaas", "frontiers in", "cell press", "annual reviews",
+    "proceedings of", "journal of", "transactions on", "conference on", "symposium on",
+    "technical report", "working paper", "national laboratory",
+    "world health organization", "nasa", "nist", "cern", "oecd", "unesco", "world bank",
     "european commission", "national institutes of health", "research council",
+    "national academies",
 )
-_REPUTABLE_RE = re.compile("|".join(re.escape(marker) for marker in REPUTABLE_MARKERS), re.IGNORECASE)
-_REFERENCES_RE = re.compile(r"\b(references|bibliography|works cited)\b", re.IGNORECASE)
-_INTRO_RE = re.compile(r"\b(introduction|abstract|methodology|methods)\b", re.IGNORECASE)
-_CITATION_RE = re.compile(r"\[\d{1,3}\]")
+_REPUTABLE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(marker) for marker in REPUTABLE_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+# A heading starts its own line, optionally numbered ("3", "3.1", "III.").
+_HEADING_PREFIX = r"^[ \t]*(?:(?:\d+(?:\.\d+)*|[IVX]+)\.?[ \t]+)?"
+_REFERENCES_HEADING_RE = re.compile(
+    _HEADING_PREFIX + r"(?:references|bibliography|works cited|literature cited)[ \t]*:?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SECTION_HEADING_RE = re.compile(
+    _HEADING_PREFIX
+    + r"(introduction|background|related work|materials and methods|methods?|methodology|"
+    r"results|discussion|conclusions?|executive summary|acknowledge?ments?)\b[^\n]{0,30}$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NUMERIC_CITATION_RE = re.compile(r"\[\d{1,3}(?:\s*[,–-]\s*\d{1,3})*\]")
+_ET_AL_RE = re.compile(r"\bet al\.", re.IGNORECASE)
 
 
-def classify_document(fields: dict) -> tuple[bool, str]:
+def _section_key(name: str) -> str:
+    name = name.lower()
+    if "method" in name:
+        return "methods"
+    if name.startswith("conclusion"):
+        return "conclusions"
+    if name.startswith("acknowledg"):
+        return "acknowledgements"
+    return name
+
+
+def classify_document(fields: dict, raw_text: Optional[str] = None) -> tuple[bool, str]:
     """
-    Decide whether an extracted document is a genuine research paper / report.
+    Decide whether an extracted document is a genuine research paper or report.
 
-    Uses several independent scholarly signals (DOI, arXiv id, an abstract, a
-    references section, a reputable publisher/institution name, in-text numeric
-    citations). A document is accepted when it shows at least
-    ``SCHOLARLY_MIN_SIGNALS`` of them — forgiving enough not to drop real papers,
-    strict enough to discard invoices, slides, receipts, and the like. Returns
+    Strong evidence scores 2: a DOI, an arXiv id, a References/Bibliography
+    heading. Supporting evidence scores 1: an abstract, two or more standard
+    section headings, in-text citations, a reputable publisher/venue/institution.
+    A document needs ``SCHOLARLY_MIN_SCORE``. ``raw_text`` keeps line breaks, so a
+    heading can be told apart from the same word in running prose ("payment
+    methods" on an invoice is not a Methods section). Returns
     ``(is_scholarly, reason)``.
     """
-    text = " ".join((
-        fields.get("title", ""),
-        fields.get("abstract", ""),
-        fields.get("keywords", ""),
-        fields.get("fulltext", ""),
-    ))
+    if raw_text is None:
+        raw_text = "\n".join(str(fields.get(key, "")) for key in ("title", "abstract", "keywords", "fulltext"))
+    score = 0
     signals: list[str] = []
-    if fields.get("doi"):
-        signals.append("DOI")
-    if fields.get("arxiv_id"):
-        signals.append("arXiv id")
-    if fields.get("abstract"):
-        signals.append("abstract")
-    if _REFERENCES_RE.search(text):
-        signals.append("references")
-    if _INTRO_RE.search(text):
-        signals.append("paper sections")
-    if len(_CITATION_RE.findall(text)) >= 3:
-        signals.append("numbered citations")
-    marker = _REPUTABLE_RE.search(text)
-    if marker:
-        signals.append(f"source '{marker.group(0).lower()}'")
 
-    is_scholarly = len(signals) >= max(1, SCHOLARLY_MIN_SIGNALS)
+    def add(points: int, label: str) -> None:
+        nonlocal score
+        score += points
+        signals.append(label)
+
+    if fields.get("doi"):
+        add(2, "DOI")
+    if fields.get("arxiv_id"):
+        add(2, "arXiv id")
+    if _REFERENCES_HEADING_RE.search(raw_text):
+        add(2, "references section")
+    if fields.get("abstract"):
+        add(1, "abstract")
+    sections = {_section_key(name) for name in _SECTION_HEADING_RE.findall(raw_text)}
+    if len(sections) >= 2:
+        add(1, "sections: " + ", ".join(sorted(sections)))
+    if len(_NUMERIC_CITATION_RE.findall(raw_text)) >= 5 or len(_ET_AL_RE.findall(raw_text)) >= 3:
+        add(1, "citations")
+    marker = _REPUTABLE_RE.search(raw_text)
+    if marker:
+        add(1, f"source '{marker.group(0).lower()}'")
+
+    is_scholarly = score >= max(1, SCHOLARLY_MIN_SCORE)
     reason = ", ".join(signals) if signals else "no scholarly markers found"
     return is_scholarly, reason
 
 
-def _extract_fields(pdf_path: str) -> dict[str, str]:
+def _extract_fields(pdf_path: str) -> dict[str, object]:
     """
-    Extract structured fields from a research paper PDF. Returns a dict with:
-    title, authors, year, abstract, keywords, fulltext, preview, doi, arxiv_id.
-    ``fulltext`` is the whole body (for the FTS index); ``preview`` is a short
-    slice kept for display.
+    Extract structured fields from a research-paper PDF: title, authors, year,
+    abstract, keywords, fulltext (whole body, for the FTS index), preview (short
+    slice for display), doi, arxiv_id, plus the flags is_scholarly, has_text and
+    doc_reason.
     """
-    pages, body = _extract_pdf_content(
+    extracted = _extract_pdf_content(
         pdf_path,
         max_front_pages=MAX_FRONT_PAGES,
         char_limit=FULLTEXT_CHARS,
     )
-    if not pages:
-        return {}
+    if not extracted.front_pages:
+        return {"is_scholarly": 0, "has_text": 0, "doc_reason": "unreadable PDF (could not be parsed)"}
 
+    pages, body = extracted.front_pages, extracted.body
     clean_body = _clean(body)
 
     page0 = pages[0]
     combined_front = "\n".join(pages[:2])
 
-    title = _guess_title(page0)
+    title = _choose_title(extracted.meta_title, extracted.font_title, page0)
     authors = _guess_authors(page0, title)
-
-    year_matches = YEAR_RE.findall(combined_front)
-    year = year_matches[0] if year_matches else ""
+    year = _guess_year(page0, combined_front, extracted.meta_year)
 
     abstract = _extract_section(
         combined_front,
@@ -372,10 +577,111 @@ def _extract_fields(pdf_path: str) -> dict[str, str]:
         "doi": doi_match.group(0)[:200] if doi_match else "",
         "arxiv_id": arxiv_match.group(1)[:50] if arxiv_match else "",
     }
-    is_scholarly, reason = classify_document(fields)
-    fields["is_scholarly"] = 1 if is_scholarly else 0
-    fields["doc_reason"] = reason[:200]
+    if len(clean_body) < MIN_TEXT_CHARS:
+        # Nothing to judge: report it as unreadable, not as a non-paper.
+        fields.update(is_scholarly=0, has_text=0, doc_reason="no text layer (scanned image? needs OCR)")
+    else:
+        is_scholarly, reason = classify_document(fields, raw_text=body)
+        fields.update(is_scholarly=int(is_scholarly), has_text=1, doc_reason=reason[:200])
     return fields
+
+
+_BAD_META_TITLE_RE = re.compile(
+    r"^(microsoft (word|powerpoint)|untitled|title\b|document\d*\b|slide)|"
+    r"\.(pdf|docx?|tex|dvi|ps|rtf|odt|indd|qxd|pptx?)\s*$",
+    re.IGNORECASE,
+)
+_VENUE_NAME_RE = re.compile(r"^(the\s+)?(journal|proceedings|transactions|annals|bulletin|archives)\b", re.IGNORECASE)
+
+
+def _word_overlap(text: str, other: str) -> float:
+    """Fraction of ``text``'s words (3+ letters) that also occur in ``other``."""
+    words = [word for word in _WORD_RE.findall(text.lower()) if len(word) >= 3]
+    if not words:
+        return 0.0
+    other_words = set(_WORD_RE.findall(other.lower()))
+    return sum(word in other_words for word in words) / len(words)
+
+
+def _choose_title(meta_title: str, font_title: str, page0: str) -> str:
+    """
+    Prefer the PDF metadata title when it is plausible and actually printed on
+    page 1 (it is exact and complete); otherwise the largest-font text on page 1;
+    otherwise the first title-shaped line. When metadata and the large-font text
+    disagree, the printed text wins: metadata is sometimes a journal name or a
+    leftover file name ("Microsoft Word - draft3.docx").
+    """
+    meta = _clean(normalize_text(meta_title))
+    meta_ok = (
+        _looks_like_title(meta)
+        and not _BAD_META_TITLE_RE.search(meta)
+        and not _VENUE_NAME_RE.match(meta)
+        and _word_overlap(meta, page0) >= 0.8
+    )
+    if font_title:
+        return meta if meta_ok and _word_overlap(meta, font_title) >= 0.6 else font_title
+    return meta if meta_ok else _guess_title(page0)
+
+
+# A year token that is not part of a DOI, arXiv id or longer number.
+_YEAR = r"(?<![\d./])((?:19[5-9]|20\d)\d)(?![.]?\d)"
+# Optional date before the year: "15 March ", "March 15, ", "March ".
+_DATE_PREFIX = (
+    r"[ \t]*:?[ \t]*(?:on[ \t]+)?(?:\d{1,2}(?:st|nd|rd|th)?[ \t]+[A-Za-z]{3,9}\.?,?[ \t]+"
+    r"|[A-Za-z]{3,9}\.?[ \t]+(?:\d{1,2},?[ \t]+)?)?"
+)
+_ARXIV_STAMP_RE = re.compile(
+    r"arXiv:\s*\d{4}\.\d{4,5}(?:v\d+)?\s*\[[^\]\n]{1,40}\]\s*\d{1,2}\s+[A-Za-z]{3,9}\.?\s+" + _YEAR,
+    re.IGNORECASE,
+)
+_ARXIV_ID_DATE_RE = re.compile(r"arXiv:\s*(\d{2})(\d{2})\.\d{4,5}", re.IGNORECASE)
+# Explicit publication evidence, most reliable first.
+_PUBLICATION_YEAR_RES = (
+    re.compile(
+        r"\b(?:published(?:[ \t]+online)?|available[ \t]+online|first[ \t]+published|"
+        r"epub(?:lished)?(?:[ \t]+ahead[ \t]+of[ \t]+print)?)\b" + _DATE_PREFIX + _YEAR,
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:©|\bcopyright\b)[^\n]{0,60}?" + _YEAR, re.IGNORECASE),
+    re.compile(
+        r"^[ \t]*(?:in[ \t]+)?(?:proceedings\b|\d{1,3}(?:st|nd|rd|th)[ \t]+(?:annual[ \t]+)?"
+        r"(?:international[ \t]+)?(?:conference|symposium|workshop|meeting)\b)[^\n]{0,120}?" + _YEAR,
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(r"\baccepted\b" + _DATE_PREFIX + _YEAR, re.IGNORECASE),
+)
+_YEAR_TOKEN_RE = re.compile(_YEAR)
+
+
+def _guess_year(page0: str, front: str, meta_year: Optional[int]) -> str:
+    """
+    Publication year, from the most to the least reliable evidence: the arXiv
+    stamp's date > "published" > copyright > proceedings header > "accepted" >
+    arXiv id (YYMM) on page 1 > latest year printed on page 1 > PDF creation
+    date. Numbers inside DOIs and identifiers are ignored (arXiv:2010.12345 is
+    October 2020, not 2010), and so are years beyond next year ("targets for 2050").
+    """
+    latest = datetime.date.today().year + 1
+
+    def plausible(values) -> list[int]:
+        return [year for year in (int(value) for value in values) if 1950 <= year <= latest]
+
+    stamp = plausible(_ARXIV_STAMP_RE.findall(page0))
+    if stamp:
+        return str(stamp[0])
+    for pattern in _PUBLICATION_YEAR_RES:
+        years = plausible(pattern.findall(front))
+        if years:
+            return str(max(years))
+    arxiv = _ARXIV_ID_DATE_RE.search(page0)
+    if arxiv and 1 <= int(arxiv.group(2)) <= 12 and 2007 <= 2000 + int(arxiv.group(1)) <= latest:
+        return str(2000 + int(arxiv.group(1)))
+    years = plausible(_YEAR_TOKEN_RE.findall(page0))
+    if years:
+        return str(max(years))
+    if meta_year and 1950 <= meta_year <= latest:
+        return str(meta_year)
+    return ""
 
 
 def _guess_title(page0: str) -> str:
@@ -398,26 +704,30 @@ def _guess_title(page0: str) -> str:
 
 
 def _guess_authors(page0: str, title: str) -> str:
-    """Return likely author lines between the title and abstract."""
-    lines = page0.splitlines()
-    title_norm = title.lower().strip()
-    in_zone = False
-    author_lines: list[str] = []
+    """Return likely author lines between the title and the abstract."""
+    lines = [line.strip() for line in page0.splitlines() if line.strip()]
+    title_norm = _clean(title).lower()
+    if not title_norm:
+        return ""
+    start = None
+    for index, line in enumerate(lines):
+        lowered = _clean(line).lower()
+        # The title may wrap over several lines; skip past every one of them.
+        if len(lowered) >= 4 and (lowered in title_norm or title_norm in lowered):
+            start = index + 1
+        elif start is not None:
+            break
+    if start is None:
+        return ""
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if title_norm and (stripped.lower() == title_norm or title_norm in stripped.lower()):
-            in_zone = True
-            continue
-        if in_zone:
-            if re.match(r"abstract\b", stripped, re.IGNORECASE):
-                break
-            if len(stripped) > 5 and not re.match(r"^\d+\.?\s", stripped):
-                author_lines.append(stripped)
-            if len(author_lines) >= 3:
-                break
+    author_lines: list[str] = []
+    for line in lines[start:]:
+        if re.match(r"abstract\b", line, re.IGNORECASE):
+            break
+        if len(line) > 5 and not re.match(r"^\d+\.?\s", line):
+            author_lines.append(line)
+        if len(author_lines) >= 3:
+            break
     return "; ".join(author_lines)
 
 
@@ -461,6 +771,7 @@ CREATE TABLE IF NOT EXISTS papers (
     doi         TEXT    DEFAULT '',
     arxiv_id    TEXT    DEFAULT '',
     is_scholarly INTEGER DEFAULT 1,   -- 1 = genuine paper/report, 0 = discarded
+    has_text    INTEGER DEFAULT 1,    -- 0 = no extractable text (scanned/damaged)
     doc_reason  TEXT    DEFAULT '',   -- why it was (not) classified as scholarly
     indexed_at  TEXT    DEFAULT (datetime('now'))
 );
@@ -522,7 +833,8 @@ FTS5_AVAILABLE = _sqlite_has_fts5()
 # v2 introduced whole-body full-text indexing (previously only ~4k chars).
 # v3 added scholarly-document classification (is_scholarly / doc_reason).
 # v4 normalises extracted text (ligatures, hyphen variants, line-break hyphens).
-INDEX_FORMAT_VERSION = 4
+# v5 reads with pdfium, adds has_text, and improves title/year/classification.
+INDEX_FORMAT_VERSION = 5
 
 
 def get_db_path(directory: str) -> str:
@@ -553,6 +865,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE papers ADD COLUMN is_scholarly INTEGER DEFAULT 1")
     if "doc_reason" not in existing:
         conn.execute("ALTER TABLE papers ADD COLUMN doc_reason TEXT DEFAULT ''")
+    if "has_text" not in existing:
+        conn.execute("ALTER TABLE papers ADD COLUMN has_text INTEGER DEFAULT 1")
 
     # One-time re-index when the extraction format changes (e.g. whole-body FTS).
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -601,10 +915,10 @@ def upsert_paper(
         """
         INSERT INTO papers (path, mtime, size, filename, title, authors, year,
                             abstract, keywords, fulltext, preview, doi, arxiv_id,
-                            is_scholarly, doc_reason, indexed_at)
+                            is_scholarly, has_text, doc_reason, indexed_at)
         VALUES (:path, :mtime, :size, :filename, :title, :authors, :year,
                 :abstract, :keywords, :fulltext, :preview, :doi, :arxiv_id,
-                :is_scholarly, :doc_reason, datetime('now'))
+                :is_scholarly, :has_text, :doc_reason, datetime('now'))
         ON CONFLICT(path) DO UPDATE SET
             mtime = excluded.mtime,
             size = excluded.size,
@@ -619,6 +933,7 @@ def upsert_paper(
             doi = excluded.doi,
             arxiv_id = excluded.arxiv_id,
             is_scholarly = excluded.is_scholarly,
+            has_text = excluded.has_text,
             doc_reason = excluded.doc_reason,
             indexed_at = excluded.indexed_at
         """,
@@ -630,6 +945,7 @@ def upsert_paper(
             # Callers that seed rows directly (not via extraction) default to
             # scholarly so they are not silently hidden from search.
             "is_scholarly": int(fields.get("is_scholarly", 1)),
+            "has_text": int(fields.get("has_text", 1)),
             "doc_reason": str(fields.get("doc_reason", "")),
             **{
                 key: fields.get(key, "")
@@ -649,9 +965,19 @@ def remove_missing(conn: sqlite3.Connection, existing_paths: set[str]) -> None:
 
 
 def count_nonscholarly(conn: sqlite3.Connection) -> int:
-    """How many indexed documents were classified as non-papers (discarded)."""
+    """How many readable documents were classified as non-papers (discarded)."""
     try:
-        return conn.execute("SELECT COUNT(*) FROM papers WHERE is_scholarly = 0").fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE is_scholarly = 0 AND has_text = 1"
+        ).fetchone()[0]
+    except sqlite3.Error:
+        return 0
+
+
+def count_textless(conn: sqlite3.Connection) -> int:
+    """How many PDFs had no extractable text (scanned images or damaged files)."""
+    try:
+        return conn.execute("SELECT COUNT(*) FROM papers WHERE has_text = 0").fetchone()[0]
     except sqlite3.Error:
         return 0
 
@@ -1009,6 +1335,7 @@ class AggregateStats(NamedTuple):
     errors: int
     cancelled: bool
     dest_dir: str
+    unreadable: int = 0     # PDFs with no extractable text: could not be checked
 
 
 def parse_keywords(raw: str) -> list[str]:
@@ -1198,6 +1525,9 @@ def aggregate_matches(
     skipped_nonpaper = 0
     cancelled = False
     try:
+        # Scanned/damaged PDFs can never match; report them so a "no match" is
+        # never mistaken for "checked and absent".
+        unreadable = count_textless(conn)
         rows = _candidate_rows(conn, keywords)
         candidates = len(rows)
         for position, row in enumerate(rows, start=1):
@@ -1222,13 +1552,13 @@ def aggregate_matches(
 
     if cancelled:
         return AggregateStats(index_stats.total, candidates, len(matched), 0,
-                              0, skipped_nonpaper, index_stats.errors, True, dest_dir)
+                              0, skipped_nonpaper, index_stats.errors, True, dest_dir, unreadable)
 
     copied, copy_errors, skipped_existing = _copy_into(matched, dest_dir)
     return AggregateStats(
         index_stats.total, candidates, len(matched), copied,
         skipped_existing, skipped_nonpaper, index_stats.errors + copy_errors,
-        False, dest_dir,
+        False, dest_dir, unreadable,
     )
 
 
@@ -1731,6 +2061,11 @@ class CollectDialog(tk.Toplevel):
             lines.append(f"{stats.skipped_existing} already in the folder — skipped (not re-copied).")
         if stats.skipped_nonpaper:
             lines.append(f"{stats.skipped_nonpaper} matched but were discarded as non-papers.")
+        if stats.unreadable:
+            lines.append(
+                f"{stats.unreadable} PDF(s) have no extractable text (scanned or damaged) "
+                "and could not be checked — OCR them to include them."
+            )
         if stats.errors:
             lines.append(f"{stats.errors} error(s) — see logs.")
 
@@ -2041,8 +2376,8 @@ class App(tk.Tk):
 
     def _check_deps(self) -> None:
         missing = []
-        if not PDFPLUMBER_OK:
-            missing.append("pdfplumber")
+        if not PDFIUM_OK:
+            missing.append("pypdfium2")
         if not RAPIDFUZZ_OK:
             missing.append("rapidfuzz")
         if missing:
@@ -2161,12 +2496,19 @@ class App(tk.Tk):
             message = f"{stats.total} PDFs total, {stats.indexed} indexed, {stats.skipped} cached"
             if stats.errors:
                 message += f", {stats.errors} errors"
-            discarded = 0
-            if REQUIRE_SCHOLARLY and self._search_conn:
-                discarded = count_nonscholarly(self._search_conn)
+            discarded = textless = 0
+            if self._search_conn:
+                textless = count_textless(self._search_conn)
+                if REQUIRE_SCHOLARLY:
+                    discarded = count_nonscholarly(self._search_conn)
+            notes = []
             if discarded:
-                message += f" — {discarded} non-paper doc(s) hidden"
-            has_note = bool(stats.errors or discarded)
+                notes.append(f"{discarded} non-paper doc(s) hidden")
+            if textless:
+                notes.append(f"{textless} without text (scanned/damaged)")
+            if notes:
+                message += " — " + ", ".join(notes)
+            has_note = bool(stats.errors or notes)
             self._set_status(message, color=THEME["highlight"] if has_note else THEME["subtext"])
             if stats.errors and stats.error_samples:
                 details = "\n".join(stats.error_samples)
@@ -2334,15 +2676,17 @@ def _run_headless_index(directory: str, force: bool, workers: Optional[int]) -> 
         f"{stats.total} PDFs total, {stats.indexed} indexed, "
         f"{stats.skipped} cached, {stats.errors} errors"
     )
-    if REQUIRE_SCHOLARLY:
-        with suppress(sqlite3.Error):
-            conn = open_db(get_db_path(directory))
-            try:
-                discarded = count_nonscholarly(conn)
-            finally:
-                conn.close()
-            if discarded:
-                print(f"  {discarded} document(s) excluded as non-papers.")
+    with suppress(sqlite3.Error):
+        conn = open_db(get_db_path(directory))
+        try:
+            discarded = count_nonscholarly(conn) if REQUIRE_SCHOLARLY else 0
+            textless = count_textless(conn)
+        finally:
+            conn.close()
+        if discarded:
+            print(f"  {discarded} document(s) excluded as non-papers.")
+        if textless:
+            print(f"  {textless} PDF(s) have no extractable text (scanned/damaged).")
     for sample in stats.error_samples:
         print(f"  ! {sample}", file=sys.stderr)
     return 1 if stats.errors else 0
@@ -2377,6 +2721,8 @@ def _run_headless_collect(
         print(f"  {stats.skipped_existing} already present in destination - skipped.")
     if stats.skipped_nonpaper:
         print(f"  {stats.skipped_nonpaper} matched but discarded as non-papers.")
+    if stats.unreadable:
+        print(f"  {stats.unreadable} PDF(s) have no extractable text (scanned/damaged) - not checked.")
     if stats.errors:
         print(f"  {stats.errors} error(s).")
     return 1 if stats.errors else 0

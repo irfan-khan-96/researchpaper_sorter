@@ -1,14 +1,15 @@
 # Runtime dependencies for the Research Paper Search tool.
 # Install with:  pip install -r requirements.txt
 #
-# The app degrades gracefully if the optional accelerators are missing:
-#   - without pdfplumber it falls back to pypdf for text extraction
-#   - without rapidfuzz it falls back to the stdlib difflib for fuzzy scoring
-# Installing all three gives the best speed and match quality.
+# PDF text is read with pdfium (fast, C++), falling back to pypdf (pure Python)
+# for files pdfium cannot open. Without rapidfuzz, fuzzy scoring falls back to
+# the stdlib difflib. Installing all three gives the best speed and accuracy.
 
-pdfplumber>=0.11.0   # primary PDF text extraction
-rapidfuzz>=3.9.0     # fast fuzzy match scoring (optional accelerator)
-pypdf>=4.0.0         # extraction fallback when pdfplumber is unavailable
+pypdfium2>=4.30.0    # primary PDF text extraction (pdfium, Apache-2.0/BSD-3)
+pypdf>=4.0.0         # extraction fallback
+rapidfuzz>=3.9.0     # fast fuzzy match scoring
+
+# Optional: pdfplumber>=0.11.0 is used as an extra fallback if installed.
 
 # The GUI uses tkinter, which ships with CPython on Windows and macOS.
 # On Debian/Ubuntu install it separately:  sudo apt install python3-tk
