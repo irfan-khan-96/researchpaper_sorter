@@ -16,9 +16,11 @@ written to stderr. Nothing operational is hard-coded into the source.
 
 import argparse
 import datetime
+import functools
 import hashlib
 import logging
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -96,7 +98,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-DB_FILENAME = os.environ.get("RPS_DB_FILENAME", ".pdf_search_index.db")
+def _default_index_dir() -> str:
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "research_paper_search", "indexes")
+
+
+# Indexes live in a local cache directory, not inside the scanned folder: that
+# folder may be read-only, and SQLite's WAL mode does not work on network shares.
+INDEX_DIR = os.environ.get("RPS_INDEX_DIR") or _default_index_dir()
 MAX_FRONT_PAGES = _env_int("RPS_MAX_FRONT_PAGES", 4)
 ABSTRACT_CHARS = _env_int("RPS_ABSTRACT_CHARS", 1200)
 # Full body text goes into the FTS index so the whole paper is searchable.
@@ -195,7 +209,7 @@ def _accumulate_pages(
     page_texts,
     max_front_pages: int,
     char_limit: int,
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, bool]:
     """
     Consume per-page text, returning the first ``max_front_pages`` pages (for
     field extraction) and the concatenated body up to ``char_limit`` chars
@@ -230,7 +244,12 @@ def _accumulate_pages(
     for page in front_pages:
         vocabulary.update(word.lower() for word in _WORD_RE.findall(page))
 
-    return [_dehyphenate(page, vocabulary) for page in front_pages], _dehyphenate(body, vocabulary)
+    truncated = not unlimited and collected >= char_limit
+    return (
+        [_dehyphenate(page, vocabulary) for page in front_pages],
+        _dehyphenate(body, vocabulary),
+        truncated,
+    )
 
 
 class ExtractedPDF(NamedTuple):
@@ -239,6 +258,7 @@ class ExtractedPDF(NamedTuple):
     meta_title: str = ""
     meta_year: Optional[int] = None
     font_title: str = ""
+    truncated: bool = False  # body stopped at char_limit; the PDF has more text
 
 
 # pdfium is not thread-safe within one process. Worker processes each have their
@@ -348,13 +368,13 @@ def _read_pdfium(pdf_path: str, max_front_pages: int, char_limit: int) -> Extrac
 
             pages = texts()
             try:
-                front, body = _accumulate_pages(pages, max_front_pages, char_limit)
+                front, body, truncated = _accumulate_pages(pages, max_front_pages, char_limit)
             finally:
                 pages.close()
         finally:
             pdf.close()
     return ExtractedPDF(front, body, _as_text(meta.get("Title")),
-                        _meta_year(meta.get("CreationDate")), font_title)
+                        _meta_year(meta.get("CreationDate")), font_title, truncated)
 
 
 def _read_pdfplumber(pdf_path: str, max_front_pages: int, char_limit: int) -> ExtractedPDF:
@@ -370,10 +390,11 @@ def _read_pdfplumber(pdf_path: str, max_front_pages: int, char_limit: int) -> Ex
 
         pages = texts()
         try:
-            front, body = _accumulate_pages(pages, max_front_pages, char_limit)
+            front, body, truncated = _accumulate_pages(pages, max_front_pages, char_limit)
         finally:
             pages.close()
-    return ExtractedPDF(front, body, _as_text(meta.get("Title")), _meta_year(meta.get("CreationDate")))
+    return ExtractedPDF(front, body, _as_text(meta.get("Title")),
+                        _meta_year(meta.get("CreationDate")), truncated=truncated)
 
 
 def _read_pypdf(pdf_path: str, max_front_pages: int, char_limit: int) -> ExtractedPDF:
@@ -389,8 +410,9 @@ def _read_pypdf(pdf_path: str, max_front_pages: int, char_limit: int) -> Extract
             except Exception:
                 yield ""
 
-    front, body = _accumulate_pages(texts(), max_front_pages, char_limit)
-    return ExtractedPDF(front, body, _as_text(meta.get("/Title")), _meta_year(meta.get("/CreationDate")))
+    front, body, truncated = _accumulate_pages(texts(), max_front_pages, char_limit)
+    return ExtractedPDF(front, body, _as_text(meta.get("/Title")),
+                        _meta_year(meta.get("/CreationDate")), truncated=truncated)
 
 
 def _extract_pdf_content(
@@ -550,18 +572,8 @@ def _extract_fields(pdf_path: str) -> dict[str, object]:
     authors = _guess_authors(page0, title)
     year = _guess_year(page0, combined_front, extracted.meta_year)
 
-    abstract = _extract_section(
-        combined_front,
-        "abstract",
-        next_sections=["introduction", "keywords", "key words", "1.", "1 "],
-    )
-
-    keywords = _extract_section(
-        combined_front,
-        r"key\s*words?",
-        next_sections=["abstract", "introduction", "1.", "1 "],
-        max_chars=400,
-    )
+    abstract = _extract_block(combined_front, _ABSTRACT_HEAD_RE, ABSTRACT_CHARS)
+    keywords = _extract_block(combined_front, _KEYWORDS_HEAD_RE, 400, max_lines=2)
 
     doi_match = DOI_RE.search(combined_front)
     arxiv_match = ARXIV_RE.search(combined_front)
@@ -574,8 +586,10 @@ def _extract_fields(pdf_path: str) -> dict[str, object]:
         "keywords": _clean(keywords)[:400],
         "fulltext": clean_body,
         "preview": clean_body[:PREVIEW_CHARS],
-        "doi": doi_match.group(0)[:200] if doi_match else "",
+        # A DOI at the end of a sentence must not keep the full stop.
+        "doi": doi_match.group(0).rstrip(".,;:)]}'\"")[:200] if doi_match else "",
         "arxiv_id": arxiv_match.group(1)[:50] if arxiv_match else "",
+        "truncated": int(extracted.truncated),
     }
     if len(clean_body) < MIN_TEXT_CHARS:
         # Nothing to judge: report it as unreadable, not as a non-paper.
@@ -731,23 +745,37 @@ def _guess_authors(page0: str, title: str) -> str:
     return "; ".join(author_lines)
 
 
-def _extract_section(
-    text: str,
-    header: str,
-    next_sections: list[str],
-    max_chars: int = ABSTRACT_CHARS,
-) -> str:
-    """Find the text under a section header and stop at the next section header."""
-    pattern = re.compile(
-        r"(?:^|\n)\s*" + header + r"\s*[:\.]?\s*\n?(.*?)(?=\n\s*(?:"
-        + "|".join(re.escape(section) for section in next_sections)
-        + r")\s*[:\.]?\s*\n|$)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    match = pattern.search(text)
-    if match:
-        return match.group(1).strip()[:max_chars]
-    return ""
+_ABSTRACT_HEAD_RE = re.compile(r"^[ \t]*abstract\b[ \t]*[:.—–-]?", re.IGNORECASE | re.MULTILINE)
+_KEYWORDS_HEAD_RE = re.compile(
+    r"^[ \t]*(?:key[ \t]*words?|index[ \t]+terms)\b[ \t]*[:.—–-]?", re.IGNORECASE | re.MULTILINE
+)
+# A line that starts the next part of the paper: a numbered heading ("1 Introduction",
+# "I. INTRODUCTION", "2.1 Data") or a known front-matter label. Structured-abstract
+# labels (Background, Methods, Results) deliberately do NOT end an abstract.
+_BLOCK_END_RE = re.compile(
+    r"^[ \t]*(?:(?:\d+(?:\.\d+)*|[IVX]+)\.?[ \t]+(?-i:[A-Z])"
+    r"|(?:abstract|introduction|key[ \t]*words?|index[ \t]+terms|ccs[ \t]+concepts|"
+    r"acm[ \t]+reference[ \t]+format|references)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_block(text: str, head_re: re.Pattern, max_chars: int, max_lines: int = 0) -> str:
+    """
+    Text after a heading such as "Abstract", up to the first line that starts the
+    next part of the paper. Only lines after the heading's own line can end the
+    block, so "Abstract—We present ..." keeps its first sentence.
+    """
+    head = head_re.search(text)
+    if not head:
+        return ""
+    rest = text[head.end():]
+    newline = rest.find("\n")
+    end = _BLOCK_END_RE.search(rest, newline + 1) if newline >= 0 else None
+    block = rest[: end.start()] if end else rest
+    if max_lines:
+        block = "\n".join([line for line in block.split("\n") if line.strip()][:max_lines])
+    return block.lstrip(" \t\n:.—–-").rstrip()[:max_chars]
 
 
 # -----------------------------------------------------------------------------
@@ -772,6 +800,7 @@ CREATE TABLE IF NOT EXISTS papers (
     arxiv_id    TEXT    DEFAULT '',
     is_scholarly INTEGER DEFAULT 1,   -- 1 = genuine paper/report, 0 = discarded
     has_text    INTEGER DEFAULT 1,    -- 0 = no extractable text (scanned/damaged)
+    truncated   INTEGER DEFAULT 0,    -- 1 = fulltext hit RPS_FULLTEXT_CHARS; PDF has more
     doc_reason  TEXT    DEFAULT '',   -- why it was (not) classified as scholarly
     indexed_at  TEXT    DEFAULT (datetime('now'))
 );
@@ -834,11 +863,16 @@ FTS5_AVAILABLE = _sqlite_has_fts5()
 # v3 added scholarly-document classification (is_scholarly / doc_reason).
 # v4 normalises extracted text (ligatures, hyphen variants, line-break hyphens).
 # v5 reads with pdfium, adds has_text, and improves title/year/classification.
-INDEX_FORMAT_VERSION = 5
+# v6 adds the FTS prefix index, the truncated flag, and better abstract bounds.
+INDEX_FORMAT_VERSION = 6
 
 
 def get_db_path(directory: str) -> str:
-    return os.path.join(directory, DB_FILENAME)
+    """Index file for ``directory``: in INDEX_DIR, keyed by the folder's absolute path."""
+    folder = os.path.normcase(os.path.abspath(directory))
+    digest = hashlib.sha1(folder.encode("utf-8")).hexdigest()[:16]
+    name = re.sub(r"[^\w.-]+", "_", os.path.basename(folder.rstrip("\\/")) or "root")[:40]
+    return os.path.join(INDEX_DIR, f"{name}-{digest}.db")
 
 
 def _configure_connection(conn: sqlite3.Connection) -> None:
@@ -867,8 +901,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE papers ADD COLUMN doc_reason TEXT DEFAULT ''")
     if "has_text" not in existing:
         conn.execute("ALTER TABLE papers ADD COLUMN has_text INTEGER DEFAULT 1")
+    if "truncated" not in existing:
+        conn.execute("ALTER TABLE papers ADD COLUMN truncated INTEGER DEFAULT 0")
 
-    # One-time re-index when the extraction format changes (e.g. whole-body FTS).
+    # One-time re-index when the extraction format changes. The FTS table is
+    # dropped too so its definition (e.g. the prefix index) is recreated current;
+    # triggers go first so clearing the rows does not touch the old FTS index.
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < INDEX_FORMAT_VERSION:
         if version:  # a brand-new database has nothing to re-index
@@ -876,14 +914,22 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 "Index format v%d -> v%d; clearing cache to re-index full text.",
                 version, INDEX_FORMAT_VERSION,
             )
+        for trigger in ("papers_ai", "papers_ad", "papers_au"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        with suppress(sqlite3.OperationalError):  # fts5 module may be missing
+            conn.execute("DROP TABLE IF EXISTS papers_fts")
         conn.execute("DELETE FROM papers")
         conn.execute(f"PRAGMA user_version = {INDEX_FORMAT_VERSION}")
 
     if FTS5_AVAILABLE:
+        fts_existed = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'papers_fts'"
+        ).fetchone() is not None
         conn.executescript(FTS_SCHEMA)
-        papers_exist = conn.execute("SELECT EXISTS(SELECT 1 FROM papers LIMIT 1)").fetchone()[0]
-        fts_rows = conn.execute("SELECT COUNT(*) FROM papers_fts").fetchone()[0]
-        if papers_exist and fts_rows == 0:
+        # A freshly created FTS table over existing rows (e.g. a DB first built
+        # without FTS5) must be filled. Checking existence is O(1); counting FTS
+        # rows on every open was O(index size).
+        if not fts_existed and conn.execute("SELECT EXISTS(SELECT 1 FROM papers)").fetchone()[0]:
             conn.execute("INSERT INTO papers_fts(papers_fts) VALUES ('rebuild')")
     else:
         LOGGER.warning("FTS5 unavailable in this SQLite build; using SQL fallback search.")
@@ -891,17 +937,22 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def open_db(db_path: str) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_MS / 1000)
     _configure_connection(conn)
     _ensure_schema(conn)
     return conn
 
 
-def needs_indexing(conn: sqlite3.Connection, path: str, mtime: float, size: int) -> bool:
-    row = conn.execute("SELECT mtime, size FROM papers WHERE path = ?", (path,)).fetchone()
-    if row is None:
-        return True
-    return abs(row["mtime"] - mtime) > 0.01 or row["size"] != size
+def open_reader(db_path: str) -> sqlite3.Connection:
+    """Read-only connection for the search thread (the schema is ensured by open_db)."""
+    conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_MS}")
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-32000")
+    return conn
 
 
 def upsert_paper(
@@ -915,10 +966,10 @@ def upsert_paper(
         """
         INSERT INTO papers (path, mtime, size, filename, title, authors, year,
                             abstract, keywords, fulltext, preview, doi, arxiv_id,
-                            is_scholarly, has_text, doc_reason, indexed_at)
+                            is_scholarly, has_text, truncated, doc_reason, indexed_at)
         VALUES (:path, :mtime, :size, :filename, :title, :authors, :year,
                 :abstract, :keywords, :fulltext, :preview, :doi, :arxiv_id,
-                :is_scholarly, :has_text, :doc_reason, datetime('now'))
+                :is_scholarly, :has_text, :truncated, :doc_reason, datetime('now'))
         ON CONFLICT(path) DO UPDATE SET
             mtime = excluded.mtime,
             size = excluded.size,
@@ -934,6 +985,7 @@ def upsert_paper(
             arxiv_id = excluded.arxiv_id,
             is_scholarly = excluded.is_scholarly,
             has_text = excluded.has_text,
+            truncated = excluded.truncated,
             doc_reason = excluded.doc_reason,
             indexed_at = excluded.indexed_at
         """,
@@ -946,6 +998,7 @@ def upsert_paper(
             # scholarly so they are not silently hidden from search.
             "is_scholarly": int(fields.get("is_scholarly", 1)),
             "has_text": int(fields.get("has_text", 1)),
+            "truncated": int(fields.get("truncated", 0)),
             "doc_reason": str(fields.get("doc_reason", "")),
             **{
                 key: fields.get(key, "")
@@ -954,14 +1007,6 @@ def upsert_paper(
             },
         },
     )
-
-
-def remove_missing(conn: sqlite3.Connection, existing_paths: set[str]) -> None:
-    indexed_paths = {row["path"] for row in conn.execute("SELECT path FROM papers")}
-    missing_paths = indexed_paths - existing_paths
-    if not missing_paths:
-        return
-    conn.executemany("DELETE FROM papers WHERE path = ?", ((path,) for path in missing_paths))
 
 
 def count_nonscholarly(conn: sqlite3.Connection) -> int:
@@ -1036,7 +1081,8 @@ def index_directory(
 
     error_samples: list[str] = []
     processed: set[str] = set()
-    indexed = errors = done = pending = 0
+    buffered: list[tuple[str, float, int, dict]] = []
+    indexed = errors = done = 0
     cancelled = False
 
     conn = open_db(db_path)
@@ -1045,9 +1091,16 @@ def index_directory(
         total = len(pdf_files)
         existing_paths = {str(path) for path in pdf_files}
 
+        # One query for the whole library instead of one lookup per file.
         if force_reindex:
             conn.execute("DELETE FROM papers")
-        remove_missing(conn, existing_paths)
+            known: dict[str, tuple[float, int]] = {}
+        else:
+            known = {row["path"]: (row["mtime"], row["size"])
+                     for row in conn.execute("SELECT path, mtime, size FROM papers")}
+            missing = known.keys() - existing_paths
+            if missing:
+                conn.executemany("DELETE FROM papers WHERE path = ?", ((path,) for path in missing))
         conn.commit()
 
         # Decide which files actually need work before spending any CPU on them.
@@ -1058,12 +1111,23 @@ def index_directory(
             except OSError:
                 continue
             path_str = str(pdf_path)
-            if force_reindex or needs_indexing(conn, path_str, stat.st_mtime, stat.st_size):
+            cached = known.get(path_str)
+            if cached is None or abs(cached[0] - stat.st_mtime) > 0.01 or cached[1] != stat.st_size:
                 to_index.append((path_str, stat.st_mtime, stat.st_size))
         skipped = total - len(to_index)
 
+        def flush() -> None:
+            # Rows are written in one short transaction per batch, so the write
+            # lock is never held while waiting on extraction and other writers
+            # (Collect, a second window) don't time out with "database is locked".
+            if buffered:
+                with conn:
+                    for args in buffered:
+                        upsert_paper(conn, *args)
+                buffered.clear()
+
         def store(path_str: str, mtime: float, size: int, fields, exc) -> None:
-            nonlocal indexed, errors, done, pending
+            nonlocal indexed, errors, done
             processed.add(path_str)
             done += 1
             report(done, len(to_index), os.path.basename(path_str))
@@ -1073,12 +1137,10 @@ def index_directory(
                     error_samples.append(f"{os.path.basename(path_str)}: {exc}")
                 LOGGER.warning("Failed to index %s: %s", path_str, exc)
                 return
-            upsert_paper(conn, path_str, mtime, size, fields)
+            buffered.append((path_str, mtime, size, fields))
             indexed += 1
-            pending += 1
-            if pending >= INDEX_COMMIT_BATCH:
-                conn.commit()
-                pending = 0
+            if len(buffered) >= INDEX_COMMIT_BATCH:
+                flush()
 
         worker_count = _resolve_worker_count(workers)
         use_pool = worker_count > 1 and len(to_index) > 1
@@ -1119,7 +1181,7 @@ def index_directory(
                 except Exception as exc:
                     store(path_str, mtime, size, None, exc)
 
-        conn.commit()
+        flush()  # also on cancel: keep the work already done
         if not cancelled:
             with suppress(sqlite3.Error):
                 conn.execute("PRAGMA optimize")
@@ -1138,14 +1200,18 @@ def _split_terms(query: str) -> list[str]:
     return [term.lower() for term in re.split(r"[\s,;]+", query.strip()) if len(term) >= 2]
 
 
-def _fts_query(terms: list[str]) -> str:
-    fts_terms: list[str] = []
+def _fts_tokens(terms: list[str]) -> list[str]:
+    """
+    Prefix tokens for FTS5. Splitting uses Unicode-aware ``\\W`` (not ASCII
+    ``[^0-9A-Za-z]``), so "schrödinger" stays one token instead of becoming
+    "schr" OR "dinger"; FTS5's unicode61 tokenizer folds the diacritics.
+    """
+    tokens: list[str] = []
     for term in terms:
-        cleaned = re.sub(r"[^0-9A-Za-z]+", " ", term).strip()
-        for token in cleaned.split():
+        for token in re.split(r"[\W_]+", term):
             if len(token) >= 2:
-                fts_terms.append(f'"{token}"*')
-    return " OR ".join(dict.fromkeys(fts_terms))
+                tokens.append(f'"{token}"*')
+    return list(dict.fromkeys(tokens))
 
 
 def _fuzzy_score(query: str, text: str) -> float:
@@ -1198,33 +1264,41 @@ def _fetch_candidate_rows(
     terms: list[str],
     year_range: Optional[tuple[int, int]],
     top_n: int,
-) -> list[sqlite3.Row]:
+) -> tuple[list[sqlite3.Row], int]:
+    """Candidates best-first, plus how many leading rows contain every term."""
     limit = max(SEARCH_CANDIDATE_LIMIT, top_n * 10)
 
     if FTS5_AVAILABLE:
-        fts_query = _fts_query(terms)
-        if fts_query:
+        tokens = _fts_tokens(terms)
+        if tokens:
+            sql = f"""
+                SELECT {_FTS_SELECT}
+                FROM papers_fts
+                JOIN papers ON papers.id = papers_fts.rowid
+                WHERE papers_fts MATCH ?
+            """
+            filters: list[object] = []
+            if year_range:
+                sql += " AND CAST(papers.year AS INTEGER) BETWEEN ? AND ?"
+                filters.extend(year_range)
+            if REQUIRE_SCHOLARLY:
+                sql += " AND papers.is_scholarly = 1"
+            # One weight per FTS column, in declared order:
+            # title, authors, year, abstract, keywords, fulltext.
+            sql += " ORDER BY bm25(papers_fts, 5.0, 2.0, 1.0, 3.0, 4.0, 1.0) LIMIT ?"
             try:
-                sql = f"""
-                    SELECT {_FTS_SELECT}
-                    FROM papers_fts
-                    JOIN papers ON papers.id = papers_fts.rowid
-                    WHERE papers_fts MATCH ?
-                """
-                params: list[object] = [fts_query]
-                if year_range:
-                    sql += " AND CAST(papers.year AS INTEGER) BETWEEN ? AND ?"
-                    params.extend(year_range)
-                if REQUIRE_SCHOLARLY:
-                    sql += " AND papers.is_scholarly = 1"
-                # One weight per FTS column, in declared order:
-                # title, authors, year, abstract, keywords, fulltext.
-                sql += " ORDER BY bm25(papers_fts, 5.0, 2.0, 1.0, 3.0, 4.0, 1.0) LIMIT ?"
-                params.append(limit)
-                # The FTS answer is final, empty or not. Falling back to a
-                # substring scan on "no results" made every miss read the full
-                # text of the whole library on the UI thread.
-                return conn.execute(sql, params).fetchall()
+                # Papers containing ALL terms come first (fewer candidates, so
+                # faster and more relevant); papers with ANY term only fill up
+                # the list when there are not enough full matches. The FTS
+                # answer is final, empty or not: falling back to a substring
+                # scan on "no results" read the whole library's text.
+                rows = conn.execute(sql, [" AND ".join(tokens), *filters, limit]).fetchall()
+                full_matches = len(rows)
+                if full_matches < top_n and len(tokens) > 1:
+                    seen = {row["id"] for row in rows}
+                    more = conn.execute(sql, [" OR ".join(tokens), *filters, limit]).fetchall()
+                    rows += [row for row in more if row["id"] not in seen]
+                return rows[:limit], min(full_matches, limit)
             except sqlite3.OperationalError:
                 LOGGER.warning("FTS query failed; falling back to SQL scan.", exc_info=True)
 
@@ -1250,7 +1324,22 @@ def _fetch_candidate_rows(
         sql += " WHERE " + " AND ".join(where_clauses)
     sql += " LIMIT ?"
     params.append(limit)
-    return conn.execute(sql, params).fetchall()
+    rows = conn.execute(sql, params).fetchall()
+    return rows, len(rows)
+
+
+def _fold(text: str) -> str:
+    """Lower-case and strip diacritics, matching how the FTS index compares text."""
+    text = text.lower()
+    if text.isascii():
+        return text
+    return "".join(char for char in unicodedata.normalize("NFKD", text) if not unicodedata.combining(char))
+
+
+@functools.lru_cache(maxsize=256)
+def _word_start_pattern(term: str) -> re.Pattern:
+    # The term must begin a word: "atten" matches "attention", "ion" does not.
+    return re.compile(r"(?<!\w)" + re.escape(_fold(term)))
 
 
 def score_paper(terms: list[str], row: sqlite3.Row) -> float:
@@ -1261,11 +1350,12 @@ def score_paper(terms: list[str], row: sqlite3.Row) -> float:
     """
     total = 0.0
     fields = {name: (row[name] or "") for name in SCORE_WEIGHTS}
-    lower_fields = {name: value.lower() for name, value in fields.items()}
+    folded_fields = {name: _fold(value) for name, value in fields.items()}
 
     for term in terms:
+        pattern = _word_start_pattern(term)
         for name, weight in SCORE_WEIGHTS.items():
-            if term in lower_fields[name]:
+            if pattern.search(folded_fields[name]):
                 total += weight * 100
                 continue
             if name in ("title", "abstract", "keywords"):
@@ -1291,24 +1381,79 @@ def search(
         return []
 
     year_range = year_filter if isinstance(year_filter, tuple) else parse_year_range(year_filter)
-    rows = _fetch_candidate_rows(conn, terms, year_range, top_n=top_n)
+    rows, full_matches = _fetch_candidate_rows(conn, terms, year_range, top_n=top_n)
     # Candidates arrive best-first (BM25 for FTS). Keep that as a base score so a
     # paper matched only deep in the body is retained, then let the field-level
-    # bonus lift exact title/keyword hits above it.
+    # bonus lift exact title/keyword hits above it. Papers containing every term
+    # form a tier of their own that partial matches can never outrank.
     total_rows = len(rows)
-    results: list[tuple[float, dict[str, object]]] = []
+    full: list[tuple[float, dict[str, object]]] = []
+    partial: list[tuple[float, dict[str, object]]] = []
     for position, row in enumerate(rows):
-        base = total_rows - position
-        results.append((base + score_paper(terms, row), dict(row)))
+        scored = (total_rows - position + score_paper(terms, row), dict(row))
+        (full if position < full_matches else partial).append(scored)
 
-    results.sort(key=lambda item: -item[0])
-    max_score = results[0][0] if results else 1.0
+    def rank(items: list, low: int, high: int) -> list[dict[str, object]]:
+        items.sort(key=lambda item: -item[0])
+        best = max(items[0][0], 1) if items else 1
+        for score, result in items:
+            result["relevance"] = int(low + (high - low) * score / best)
+        return [result for _, result in items]
 
-    output: list[dict[str, object]] = []
-    for raw_score, result in results[:top_n]:
-        result["relevance"] = min(100, int(raw_score / max(max_score, 1) * 100))
-        output.append(result)
-    return output
+    if full and partial:  # full matches 50-100%, partial matches below them
+        return (rank(full, 50, 100) + rank(partial, 0, 50))[:top_n]
+    return rank(full or partial, 0, 100)[:top_n]
+
+
+class SearchWorker(threading.Thread):
+    """
+    Runs searches off the UI thread, on its own read-only connection. Requests
+    are coalesced: while one search runs, only the newest pending request is
+    kept, so fast typing never queues stale work. Each outcome is delivered as
+    ``on_result(seq, results, error)`` on this thread; callers marshal it to
+    their UI and drop results whose ``seq`` is no longer current.
+    """
+
+    def __init__(self, on_result: Callable[[int, Optional[list], Optional[Exception]], None]):
+        super().__init__(daemon=True, name="search")
+        self._on_result = on_result
+        self._requests: queue.Queue = queue.Queue()
+
+    def submit(self, db_path: str, query: str, year_filter, seq: int) -> None:
+        self._requests.put((db_path, query, year_filter, seq))
+
+    def stop(self) -> None:
+        self._requests.put(None)
+
+    def run(self) -> None:
+        conn: Optional[sqlite3.Connection] = None
+        conn_path: Optional[str] = None
+        try:
+            while True:
+                request = self._requests.get()
+                while request is not None:  # skip to the newest request
+                    try:
+                        request = self._requests.get_nowait()
+                    except queue.Empty:
+                        break
+                if request is None:
+                    return
+                db_path, query, year_filter, seq = request
+                try:
+                    if db_path != conn_path:
+                        if conn is not None:
+                            conn.close()
+                        conn, conn_path = None, None
+                        conn, conn_path = open_reader(db_path), db_path
+                    results = search(conn, query, year_filter=year_filter)
+                except Exception as exc:  # report and keep serving
+                    self._on_result(seq, None, exc)
+                else:
+                    self._on_result(seq, results, None)
+        finally:
+            if conn is not None:
+                with suppress(sqlite3.Error):
+                    conn.close()
 
 
 # -----------------------------------------------------------------------------
@@ -1336,6 +1481,9 @@ class AggregateStats(NamedTuple):
     cancelled: bool
     dest_dir: str
     unreadable: int = 0     # PDFs with no extractable text: could not be checked
+    # Copied, but sharing a DOI/arXiv id with a paper already in the destination
+    # (e.g. preprint vs. published version): "new.pdf ~ old.pdf (same DOI)".
+    possible_duplicates: tuple = ()
 
 
 def parse_keywords(raw: str) -> list[str]:
@@ -1380,14 +1528,21 @@ def paper_matches(row, patterns: list[re.Pattern]) -> bool:
     return all(any(pattern.search(text) for text in texts) for pattern in patterns)
 
 
+_CANDIDATE_COLUMNS = ", ".join(
+    f"papers.{column}"
+    for column in (*MATCH_FIELDS, "id", "path", "is_scholarly", "truncated", "doi", "arxiv_id")
+)
+
+
 def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlite3.Row]:
     """
     Narrow to papers that plausibly contain all keywords. FTS does this fast over
-    huge collections; the caller still verifies each hit exactly. Falls back to a
-    full scan when FTS5 is unavailable (correctness is unaffected either way).
+    huge collections; the caller still verifies each hit exactly. Papers whose
+    stored text was cut at RPS_FULLTEXT_CHARS are always included, because a
+    keyword beyond the cut is invisible to FTS. Falls back to a full scan when
+    FTS5 is unavailable (correctness is unaffected either way).
     """
-    fields = ", ".join(f"papers.{field}" for field in MATCH_FIELDS)
-    columns = f"{fields}, papers.path, papers.is_scholarly"
+    rows = None
     if FTS5_AVAILABLE:
         phrases = []
         for keyword in keywords:
@@ -1395,19 +1550,28 @@ def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlit
             if tokens:
                 phrases.append('"' + " ".join(tokens) + '"')
         if phrases:
-            match_query = " AND ".join(phrases)
             try:
-                sql = (
-                    f"SELECT {columns} FROM papers_fts "
-                    "JOIN papers ON papers.id = papers_fts.rowid "
-                    "WHERE papers_fts MATCH ?"
-                )
-                return conn.execute(sql, [match_query]).fetchall()
+                rows = conn.execute(
+                    f"SELECT {_CANDIDATE_COLUMNS} FROM papers_fts "
+                    "JOIN papers ON papers.id = papers_fts.rowid WHERE papers_fts MATCH ?",
+                    [" AND ".join(phrases)],
+                ).fetchall()
             except sqlite3.OperationalError:
                 LOGGER.warning("Aggregation FTS query failed; scanning all rows.", exc_info=True)
+    if rows is None:
+        return conn.execute(f"SELECT {_CANDIDATE_COLUMNS} FROM papers").fetchall()
+    seen = {row["id"] for row in rows}
+    truncated = conn.execute(f"SELECT {_CANDIDATE_COLUMNS} FROM papers WHERE truncated = 1")
+    return rows + [row for row in truncated if row["id"] not in seen]
 
-    plain = ", ".join(MATCH_FIELDS)
-    return conn.execute(f"SELECT {plain}, path, is_scholarly FROM papers").fetchall()
+
+def _with_full_text(row) -> dict:
+    """The row with ``fulltext`` replaced by the PDF's complete, uncapped text."""
+    full = dict(row)
+    extracted = _extract_pdf_content(row["path"], max_front_pages=1, char_limit=0)
+    if extracted.body:
+        full["fulltext"] = _clean(extracted.body)
+    return full
 
 
 def _hash_file(path: str, chunk: int = 1 << 20) -> str:
@@ -1419,71 +1583,101 @@ def _hash_file(path: str, chunk: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
-def _copy_into(paths: list[str], dest_dir: str) -> tuple[int, int, int]:
+def _free_name(base: str, dest_dir: str, taken: set[str]) -> str:
+    """``base``, or "stem (n).ext" if that name is already used in ``dest_dir``."""
+    stem, ext = os.path.splitext(base)
+    name, counter = base, 1
+    while name in taken or os.path.exists(os.path.join(dest_dir, name)):
+        name = f"{stem} ({counter}){ext}"
+        counter += 1
+    return name
+
+
+def _copy_into(paths: list[str], dest_dir: str) -> tuple[list[tuple[str, str]], int, int]:
     """
-    Copy files into ``dest_dir``, skipping any paper whose content is already
-    there (identical bytes), and de-duplicating merely-colliding names. Existing
-    files are hashed lazily and only when a source shares their size, so the
-    identity check stays cheap. Returns ``(copied, errors, skipped_existing)``.
+    Copy files into ``dest_dir``, skipping any whose bytes are already there and
+    renaming merely-colliding names. A file is hashed only when another file of
+    the same size exists (in the destination or copied earlier in this run), so
+    the common case does no hashing at all. Returns ``(copied, errors,
+    skipped_existing)``, where ``copied`` lists ``(source path, new file name)``.
     """
     os.makedirs(dest_dir, exist_ok=True)
-
-    dest_by_size: dict[int, list[str]] = {}
-    existing_names: set[str] = set()
+    by_size: dict[int, list[str]] = {}
+    names: set[str] = set()
     for entry in os.scandir(dest_dir):
         if entry.is_file():
-            existing_names.add(entry.name)
+            names.add(entry.name)
             with suppress(OSError):
-                dest_by_size.setdefault(entry.stat().st_size, []).append(entry.path)
+                by_size.setdefault(entry.stat().st_size, []).append(entry.path)
 
-    present_hashes: dict[int, set[str]] = {}
-    hashed_sizes: set[int] = set()
+    digests: dict[str, Optional[str]] = {}
 
-    def hashes_for(size: int) -> set[str]:
-        bucket = present_hashes.setdefault(size, set())
-        if size not in hashed_sizes:  # hash same-size dest files once, on demand
-            for existing in dest_by_size.get(size, []):
-                with suppress(OSError):
-                    bucket.add(_hash_file(existing))
-            hashed_sizes.add(size)
-        return bucket
+    def digest_of(path: str) -> Optional[str]:
+        if path not in digests:
+            try:
+                digests[path] = _hash_file(path)
+            except OSError:
+                digests[path] = None
+        return digests[path]
 
-    copied = errors = skipped_existing = 0
+    copied: list[tuple[str, str]] = []
+    errors = skipped_existing = 0
     for path in paths:
         try:
             size = os.path.getsize(path)
-            digest = _hash_file(path)
         except OSError as exc:
             errors += 1
             LOGGER.warning("Could not read %s: %s", path, exc)
             continue
-
-        if digest in hashes_for(size):
-            skipped_existing += 1
-            continue
-
-        base = os.path.basename(path)
-        target = os.path.join(dest_dir, base)
-        if base in existing_names or os.path.exists(target):
-            stem, ext = os.path.splitext(base)
-            counter = 1
-            while True:
-                candidate_name = f"{stem} ({counter}){ext}"
-                candidate = os.path.join(dest_dir, candidate_name)
-                if candidate_name not in existing_names and not os.path.exists(candidate):
-                    base, target = candidate_name, candidate
-                    break
-                counter += 1
+        same_size = by_size.get(size, [])
+        if same_size:
+            digest = digest_of(path)
+            if digest is not None and any(digest_of(other) == digest for other in same_size):
+                skipped_existing += 1
+                continue
+        name = _free_name(os.path.basename(path), dest_dir, names)
+        target = os.path.join(dest_dir, name)
         try:
             shutil.copy2(path, target)
         except OSError as exc:
             errors += 1
             LOGGER.warning("Could not copy %s: %s", path, exc)
             continue
-        copied += 1
-        existing_names.add(base)
-        present_hashes.setdefault(size, set()).add(digest)  # catch within-run dupes
+        names.add(name)
+        by_size.setdefault(size, []).append(target)
+        if path in digests:
+            digests[target] = digests[path]  # identical bytes
+        copied.append((path, name))
     return copied, errors, skipped_existing
+
+
+def _identifier_keys(doi: str, arxiv_id: str) -> list[str]:
+    keys = []
+    if doi:
+        keys.append("doi:" + doi.lower())
+    if arxiv_id:
+        keys.append("arxiv:" + arxiv_id.lower())
+    return keys
+
+
+def _destination_identifiers(
+    dest_dir: str, workers: Optional[int], progress: Callable[[int, int, str], None]
+) -> dict[str, str]:
+    """DOI / arXiv id -> file name for papers already in the destination folder."""
+    if not os.path.isdir(dest_dir):
+        return {}
+    db_path = get_db_path(dest_dir)
+    index_directory(dest_dir, db_path, workers=workers, progress=progress)  # incremental, cached
+    conn = open_db(db_path)
+    try:
+        identifiers: dict[str, str] = {}
+        for row in conn.execute("SELECT filename, doi, arxiv_id FROM papers"):
+            for key in _identifier_keys(row["doi"], row["arxiv_id"]):
+                identifiers.setdefault(key, row["filename"])
+        return identifiers
+    finally:
+        with suppress(sqlite3.Error):
+            conn.close()
 
 
 def aggregate_matches(
@@ -1499,7 +1693,8 @@ def aggregate_matches(
     """
     Copy every paper under ``source_dir`` that exactly contains ALL ``keywords``
     into ``dest_dir``. ``progress(phase, done, total, name)`` reports the
-    "index" and "match" phases; ``should_cancel()`` allows interruption.
+    "index", "match" and "dest" (reading the destination's existing papers)
+    phases; ``should_cancel()`` allows interruption.
     """
     report = progress or (lambda *_: None)
     cancel = should_cancel or (lambda: False)
@@ -1521,7 +1716,7 @@ def aggregate_matches(
 
     dest_prefix = os.path.abspath(dest_dir) + os.sep
     conn = open_db(db_path)
-    matched: list[str] = []
+    matched: list[tuple[str, str, str]] = []  # (path, doi, arxiv_id)
     skipped_nonpaper = 0
     cancelled = False
     try:
@@ -1539,13 +1734,14 @@ def aggregate_matches(
             # Never re-collect files already sitting in the destination folder.
             if os.path.abspath(path).startswith(dest_prefix):
                 continue
-            if paper_matches(row, patterns):
+            checked = _with_full_text(row) if row["truncated"] else row
+            if paper_matches(checked, patterns):
                 # Only genuine papers/reports are collected; the rest are counted
                 # so the user can be told they were excluded.
                 if REQUIRE_SCHOLARLY and not row["is_scholarly"]:
                     skipped_nonpaper += 1
                 else:
-                    matched.append(path)
+                    matched.append((path, row["doi"] or "", row["arxiv_id"] or ""))
     finally:
         with suppress(sqlite3.Error):
             conn.close()
@@ -1554,11 +1750,29 @@ def aggregate_matches(
         return AggregateStats(index_stats.total, candidates, len(matched), 0,
                               0, skipped_nonpaper, index_stats.errors, True, dest_dir, unreadable)
 
-    copied, copy_errors, skipped_existing = _copy_into(matched, dest_dir)
+    # Same paper, different file (e.g. arXiv preprint vs. publisher PDF): copy it,
+    # but flag it, since a DOI/arXiv id read from page 1-2 is strong but not proof.
+    keys_by_path = {path: _identifier_keys(doi, arxiv) for path, doi, arxiv in matched}
+    known_ids = (
+        _destination_identifiers(dest_dir, workers, lambda done, total, name: report("dest", done, total, name))
+        if any(keys_by_path.values()) else {}
+    )
+
+    copied, copy_errors, skipped_existing = _copy_into([path for path, _, _ in matched], dest_dir)
+    flags: list[str] = []
+    for source, name in copied:
+        keys = keys_by_path.get(source, [])
+        for key in keys:
+            other = known_ids.get(key)
+            if other and other != name:
+                flags.append(f"{name} ~ {other} (same {'DOI' if key.startswith('doi:') else 'arXiv id'})")
+                break
+        for key in keys:
+            known_ids.setdefault(key, name)  # also catch pairs within this run
     return AggregateStats(
-        index_stats.total, candidates, len(matched), copied,
+        index_stats.total, candidates, len(matched), len(copied),
         skipped_existing, skipped_nonpaper, index_stats.errors + copy_errors,
-        False, dest_dir, unreadable,
+        False, dest_dir, unreadable, tuple(flags),
     )
 
 
@@ -2024,6 +2238,8 @@ class CollectDialog(tk.Toplevel):
         def progress(phase: str, done: int, total: int, name: str) -> None:
             if phase == "index":
                 self._ui(self._set_status, f"Indexing {done}/{total}: {name[:48]}")
+            elif phase == "dest":
+                self._ui(self._set_status, f"Checking destination for duplicates {done}/{total}…")
             else:
                 self._ui(self._set_status, f"Scanning matches {done}/{total}…")
 
@@ -2066,11 +2282,20 @@ class CollectDialog(tk.Toplevel):
                 f"{stats.unreadable} PDF(s) have no extractable text (scanned or damaged) "
                 "and could not be checked — OCR them to include them."
             )
+        if stats.possible_duplicates:
+            shown = "\n  ".join(stats.possible_duplicates[:5])
+            more = len(stats.possible_duplicates) - 5
+            lines.append(
+                f"{len(stats.possible_duplicates)} copied paper(s) share a DOI/arXiv id with one "
+                f"already there — possibly another version of the same paper; please check:\n  {shown}"
+                + (f"\n  …and {more} more" if more > 0 else "")
+            )
         if stats.errors:
             lines.append(f"{stats.errors} error(s) — see logs.")
 
         color = (
-            THEME["green"] if stats.copied
+            THEME["highlight"] if stats.possible_duplicates
+            else THEME["green"] if stats.copied
             else THEME["highlight"] if (stats.skipped_existing or stats.skipped_nonpaper)
             else THEME["subtext"]
         )
@@ -2124,6 +2349,12 @@ class App(tk.Tk):
         self._render_token = 0
         self._render_after_id = None
         self._closing = False
+        # Searches run on a background thread so the UI never waits on SQLite.
+        self._search_seq = 0
+        self._searcher = SearchWorker(
+            lambda seq, results, error: self._safe_after(self._on_search_result, seq, results, error)
+        )
+        self._searcher.start()
 
         self._setup_styles()
         self._build_ui()
@@ -2362,6 +2593,7 @@ class App(tk.Tk):
     def _on_close(self) -> None:
         self._closing = True
         self._index_job_id += 1
+        self._searcher.stop()
         self._cancel_render()
         if self._search_after_id:
             with suppress(tk.TclError):
@@ -2534,6 +2766,7 @@ class App(tk.Tk):
         query = self._query_var.get().strip()
         year = self._year_var.get().strip() or None
 
+        self._search_seq += 1  # any result still in flight is now stale
         if not query:
             self._last_query = ""
             self._clear_results()
@@ -2541,16 +2774,20 @@ class App(tk.Tk):
 
         self._last_query = query
 
-        if not self._search_conn:
+        if not self._db_path:
             self._set_status("Please select a directory first.", color=THEME["highlight"])
             return
 
-        try:
-            results = search(self._search_conn, query, year_filter=year)
-            self._render_results(results)
-        except sqlite3.Error as exc:
+        self._searcher.submit(self._db_path, query, year, self._search_seq)
+
+    def _on_search_result(self, seq: int, results: Optional[list], error: Optional[Exception]) -> None:
+        if seq != self._search_seq or self._closing:
+            return  # superseded by a newer query
+        if error is not None:
             self._set_status("Search failed. Please try reloading the directory.", color=THEME["red"])
-            LOGGER.exception("Search failed: %s", exc)
+            LOGGER.error("Search failed: %s", error)
+            return
+        self._render_results(results)
 
     # Results -----------------------------------------------------------------
 
@@ -2706,7 +2943,7 @@ def _run_headless_collect(
         return 2
 
     def progress(phase: str, done: int, total: int, name: str) -> None:
-        label = "Indexing" if phase == "index" else "Scanning"
+        label = {"index": "Indexing", "dest": "Checking destination"}.get(phase, "Scanning")
         print(f"\r{label} {done}/{total} {name[:48]:<48}", end="", file=sys.stderr, flush=True)
 
     stats = aggregate_matches(
@@ -2723,6 +2960,10 @@ def _run_headless_collect(
         print(f"  {stats.skipped_nonpaper} matched but discarded as non-papers.")
     if stats.unreadable:
         print(f"  {stats.unreadable} PDF(s) have no extractable text (scanned/damaged) - not checked.")
+    if stats.possible_duplicates:
+        print(f"  {len(stats.possible_duplicates)} copied paper(s) share a DOI/arXiv id with one already there:")
+        for note in stats.possible_duplicates:
+            print(f"    {note}")
     if stats.errors:
         print(f"  {stats.errors} error(s).")
     return 1 if stats.errors else 0

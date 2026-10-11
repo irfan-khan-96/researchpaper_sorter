@@ -107,7 +107,8 @@ defaults — nothing is hard‑coded. Override any of these before launching:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `RPS_DB_FILENAME` | `.pdf_search_index.db` | Index filename (stored inside the scanned folder) |
+| `RPS_INDEX_DIR` | `%LOCALAPPDATA%\research_paper_search\indexes` (Windows), `~/Library/Caches/...` (macOS), `~/.cache/...` (Linux) | Where index files are kept (one per scanned folder) |
+esearch_paper_search\indexes` (Windows), `~/Library/Caches/...` (macOS), `~/.cache/...` (Linux) | Where index files are kept (one per scanned folder) |
 | `RPS_MAX_FRONT_PAGES` | `4` | Front pages scanned for title/authors/abstract |
 | `RPS_ABSTRACT_CHARS` | `1200` | Max abstract characters stored |
 | `RPS_FULLTEXT_CHARS` | `200000` | Max body characters indexed for full‑text search (`0` = no cap) |
@@ -151,18 +152,38 @@ as you would any other process output.
 4. **Store** them in SQLite; an FTS5 virtual table + triggers keep a whole‑document
    full‑text index in sync. Only a short `preview` of the body is kept in the base
    table for the re‑rank pass, so search stays fast.
-5. **Search** runs an FTS/BM25 candidate query over the whole document, then
-   re‑ranks candidates in Python with exact + fuzzy matching on the short,
-   high‑signal fields for precise ordering.
+5. **Search** runs an FTS/BM25 candidate query over the whole document on a
+   background thread (typing never waits on the database). Papers containing
+   *all* query terms rank above papers containing only some; within each group,
+   candidates are re‑ranked with word‑start and fuzzy matching on the short,
+   high‑signal fields. Accented terms work as typed or without accents.
 
 **Exact collection** is separate and stricter: FTS only narrows candidates, then a
 whole‑word/phrase regex decides matches (zero false positives), a paper must match
 *every* keyword, non‑papers are excluded, and content‑identical files already in
-the destination are skipped.
+the destination are skipped. Papers longer than `RPS_FULLTEXT_CHARS` are checked
+against their complete text, never just the indexed part. A copied paper that
+shares a DOI/arXiv id with one already in the destination (e.g. a preprint and
+its published version) is copied but flagged for you to review.
 
-The index lives *inside the scanned folder* as `.pdf_search_index.db` (plus WAL
-sidecars), so it travels with the papers and is ignored by git. Upgrading to a
-new index format triggers a **one‑time re‑index** of that folder on next open.
+Indexes live in a local cache directory (`RPS_INDEX_DIR`), one file per scanned
+folder, so read‑only folders and network shares work and your paper folders stay
+untouched. Upgrading to a new index format triggers a **one‑time re‑index** of that
+folder on next open. (Older versions wrote `.pdf_search_index.db*` files into the
+scanned folders; those can be deleted.)
+
+---
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+The tests generate their own PDFs (ligature glyphs, multi‑line titles, arXiv
+stamps, scanned and damaged files) and keep their indexes in a temporary
+directory.
 
 ---
 
