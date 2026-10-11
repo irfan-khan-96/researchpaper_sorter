@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import unicodedata
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import suppress
 from pathlib import Path
@@ -140,15 +141,52 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Hyphen variants that should compare equal to "-"; the soft hyphen is invisible
+# in print and is simply dropped.
+_HYPHEN_TRANSLATION = str.maketrans({"‐": "-", "‑": "-", "­": None})
+
+
+def normalize_text(text: str) -> str:
+    """
+    Canonicalise text so it compares the way it reads. NFKC expands typographic
+    ligatures that publisher PDFs emit ("classiﬁcation" -> "classification") and
+    folds other compatibility characters; hyphen variants become "-". Applied
+    to extracted text, search terms, and collection keywords alike.
+    """
+    return unicodedata.normalize("NFKC", text).translate(_HYPHEN_TRANSLATION)
+
+
+_LINE_BREAK_HYPHEN_RE = re.compile(r"(\w+)-[ \t]*\r?\n[ \t]*(\w+)")
+_WORD_RE = re.compile(r"\w+")
+
+
+def _dehyphenate(text: str, vocabulary: set[str]) -> str:
+    """
+    Repair words split across a line break ("learn-\\ning"). If the joined form
+    occurs elsewhere in the same document it is a typesetting break and the
+    pieces are fused ("learning"); otherwise the hyphen is genuine and kept
+    ("self-supervised"), so neither form is corrupted.
+    """
+    def join(match: re.Match) -> str:
+        head, tail = match.group(1), match.group(2)
+        if (head + tail).lower() in vocabulary:
+            return head + tail
+        return f"{head}-{tail}"
+
+    return _LINE_BREAK_HYPHEN_RE.sub(join, text)
+
+
 def _accumulate_pages(
     page_texts,
     max_front_pages: int,
     char_limit: int,
 ) -> tuple[list[str], str]:
     """
-    Consume per-page text, returning the first ``max_front_pages`` pages verbatim
-    (for field extraction) and the concatenated body up to ``char_limit`` chars
-    (``char_limit <= 0`` means the whole document).
+    Consume per-page text, returning the first ``max_front_pages`` pages (for
+    field extraction) and the concatenated body up to ``char_limit`` chars
+    (``char_limit <= 0`` means the whole document). All text is normalised and
+    line-break hyphenation is repaired, so search and exact matching see words
+    as they read rather than as the PDF encodes them.
     """
     front_pages: list[str] = []
     text_parts: list[str] = []
@@ -156,6 +194,7 @@ def _accumulate_pages(
     unlimited = char_limit <= 0
 
     for page_index, text in enumerate(page_texts):
+        text = normalize_text(text)
         want_more = unlimited or collected < char_limit
         if page_index >= max_front_pages and not want_more:
             break
@@ -166,7 +205,14 @@ def _accumulate_pages(
             text_parts.append(chunk)
             collected += len(chunk)
 
-    return front_pages, " ".join(text_parts)
+    # Join pages with a newline so a word hyphenated across a page break is
+    # repaired too; whitespace is collapsed later by _clean.
+    body = "\n".join(text_parts)
+    vocabulary = {word.lower() for word in _WORD_RE.findall(body)}
+    for page in front_pages:
+        vocabulary.update(word.lower() for word in _WORD_RE.findall(page))
+
+    return [_dehyphenate(page, vocabulary) for page in front_pages], _dehyphenate(body, vocabulary)
 
 
 def _extract_pdf_content(
@@ -475,7 +521,8 @@ FTS5_AVAILABLE = _sqlite_has_fts5()
 # Bump when the stored fields change in a way that requires re-extraction.
 # v2 introduced whole-body full-text indexing (previously only ~4k chars).
 # v3 added scholarly-document classification (is_scholarly / doc_reason).
-INDEX_FORMAT_VERSION = 3
+# v4 normalises extracted text (ligatures, hyphen variants, line-break hyphens).
+INDEX_FORMAT_VERSION = 4
 
 
 def get_db_path(directory: str) -> str:
@@ -761,6 +808,7 @@ def index_directory(
 # -----------------------------------------------------------------------------
 
 def _split_terms(query: str) -> list[str]:
+    query = normalize_text(query)
     return [term.lower() for term in re.split(r"[\s,;]+", query.strip()) if len(term) >= 2]
 
 
@@ -847,9 +895,10 @@ def _fetch_candidate_rows(
                 # title, authors, year, abstract, keywords, fulltext.
                 sql += " ORDER BY bm25(papers_fts, 5.0, 2.0, 1.0, 3.0, 4.0, 1.0) LIMIT ?"
                 params.append(limit)
-                rows = conn.execute(sql, params).fetchall()
-                if rows:
-                    return rows
+                # The FTS answer is final, empty or not. Falling back to a
+                # substring scan on "no results" made every miss read the full
+                # text of the whole library on the UI thread.
+                return conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 LOGGER.warning("FTS query failed; falling back to SQL scan.", exc_info=True)
 
@@ -983,7 +1032,9 @@ def compile_keyword_patterns(keywords: list[str], match_case: bool) -> list[re.P
     flags = 0 if match_case else re.IGNORECASE
     patterns: list[re.Pattern] = []
     for keyword in keywords:
-        tokens = keyword.split()
+        # Normalise exactly like the indexed text, or a keyword typed with a
+        # compatibility character could never match.
+        tokens = normalize_text(keyword).split()
         if not tokens:
             continue
         body = r"\s+".join(re.escape(token) for token in tokens)
@@ -992,9 +1043,14 @@ def compile_keyword_patterns(keywords: list[str], match_case: bool) -> list[re.P
 
 
 def paper_matches(row, patterns: list[re.Pattern]) -> bool:
-    """A paper matches only if EVERY keyword pattern is found in its text."""
-    text = " ".join(str(row[field] or "") for field in MATCH_FIELDS)
-    return all(pattern.search(text) for pattern in patterns)
+    """
+    A paper matches only if EVERY keyword is found, each wholly inside a single
+    field. Fields are searched separately so a phrase can never be stitched
+    together across a field boundary (e.g. a title ending in "Machine" followed
+    by authors starting with "Learning").
+    """
+    texts = [str(row[field] or "") for field in MATCH_FIELDS]
+    return all(any(pattern.search(text) for text in texts) for pattern in patterns)
 
 
 def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlite3.Row]:

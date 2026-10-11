@@ -136,7 +136,9 @@ as you would any other process output.
 
 1. **Walk** the directory for `*.pdf` files.
 2. **Extract** structured fields from the first few pages plus the **full body
-   text** (in parallel worker processes).
+   text** (in parallel worker processes). Text is normalised so it matches the
+   way it reads: ligatures are expanded ("ﬁ" → "fi"), hyphen variants unified,
+   and words split across line breaks rejoined ("learn‑/ing" → "learning").
 3. **Classify** each document from scholarly signals (DOI, arXiv id, abstract,
    references, reputable publisher/institution names, numbered citations). Genuine
    papers/reports are kept; the rest are flagged and hidden from results.
