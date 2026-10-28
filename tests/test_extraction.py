@@ -157,3 +157,38 @@ def test_pdfium_much_faster_than_pdfplumber(tmp_path):
         timings[name] = time.perf_counter() - start
         assert "graph neural networks" in result.body
     assert timings["pdfplumber"] > 3 * timings["pdfium"], timings
+
+
+@pytest.mark.parametrize("cover", [
+    "PROJECT ACACIA - CONSULTATION PAPER | NOVEMBER 2024 1\nExploring digital money\nIntroduction",
+    "Secure Asset Transfer Protocol (SATP) Core (draft-ietf-satp-core-16)\nAuthors: M. H.",
+    "Bank of England\nStaff Working Paper No. 1,000\nInnovations in wholesale settlement",
+    "BIS Innovation Hub\nProject mBridge: an update\nOctober 2023",
+])
+def test_institutional_reports_accepted_from_cover(cover):
+    ok, reason = rps.classify_document({}, raw_text=cover + "\n" + "Body text. " * 200)
+    assert ok and reason.startswith("issued by"), reason
+
+
+def test_issuer_deep_in_body_or_cbdc_topic_is_not_enough():
+    lecture = "Wholesale Central Bank Digital Currency\nLecture 3\n" + "Slide text. " * 300
+    assert not rps.classify_document({}, raw_text=lecture)[0]
+    mention = "Course notes\n" + "Filler. " * 400 + "\nAs the Bank of England noted, ..."
+    assert not rps.classify_document({}, raw_text=mention)[0]
+
+
+def test_long_text_split_into_index_head_and_stored_tail(tmp_path, monkeypatch):
+    path = tmp_path / "long.pdf"
+    make_pdf(path, [paper_page()] + [[(10, f"Line {i} on page {p}.") for i in range(45)] for p in range(4)])
+    monkeypatch.setattr(rps, "FULLTEXT_CHARS", 1000)
+    fields = rps._extract_fields(str(path))
+    whole = rps._clean(rps._extract_pdf_content(str(path), char_limit=0).body)
+    assert len(fields["fulltext"]) == 1000 and fields["truncated"] == 0
+    assert fields["fulltext"] + rps.zlib.decompress(fields["tail"]).decode() == whole
+
+
+def test_bare_ietf_mention_is_not_an_issuer():
+    slides = "TLS and SSH\nLecture 4, Network Security\nStandardised by the IETF.\n" + "Slide. " * 300
+    assert not rps.classify_document({}, raw_text=slides)[0]
+    draft = "Internet-Draft                                   Gateway Recovery\nIntended status: Informational\n"
+    assert rps.classify_document({}, raw_text=draft + "Body. " * 300)[0]

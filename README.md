@@ -26,9 +26,11 @@ so re‑opening a large library is near‑instant.
   false positives (whole‑word matching only). Papers already in the destination
   are detected by content and skipped (never duplicated), and you're told how
   many were skipped.
-- **Scholarly‑only** — only genuine research papers and institutional reports are
-  surfaced; other PDFs (invoices, slides, receipts…) are discarded, and the count
-  is reported so nothing goes missing silently.
+- **Scholarly‑only** — only genuine research papers and institutional reports
+  (central banks, BIS, IMF, standards bodies, …) are surfaced; other PDFs
+  (invoices, slides, receipts…) are hidden. **Hidden…** lists every hidden PDF
+  with the reason, and you can include any of them; your choice survives
+  re‑indexing.
 - **Incremental indexing** — files are skipped unless their size or modification
   time changed.
 - **Parallel extraction** — PDF text extraction is fanned out across CPU cores,
@@ -65,7 +67,9 @@ Choose a folder, wait for the one‑time index to build, then type to search. Us
 the **Years** box to filter by a single year or a range (`2024`, `2020-2025`,
 `2020-`, `-2019`). Result cards stay compact — click **Show abstract** to expand
 the full abstract for any result. Double‑click a result (or **Open PDF**) to open
-it; **Reveal** shows it in your file manager.
+it; **Reveal** shows it in your file manager. **Hidden…** shows PDFs left out of
+results (not judged a paper/report, or no extractable text) and lets you include
+them; right‑click a result → **Hide from results** for the opposite case. macOS `._*` files and recycle‑bin/system folders are never indexed.
 
 ### Headless indexing (admin/one‑off process)
 Pre‑build or refresh the cache without opening a window — handy for large
@@ -111,8 +115,8 @@ defaults — nothing is hard‑coded. Override any of these before launching:
 esearch_paper_search\indexes` (Windows), `~/Library/Caches/...` (macOS), `~/.cache/...` (Linux) | Where index files are kept (one per scanned folder) |
 | `RPS_MAX_FRONT_PAGES` | `4` | Front pages scanned for title/authors/abstract |
 | `RPS_ABSTRACT_CHARS` | `1200` | Max abstract characters stored |
-| `RPS_FULLTEXT_CHARS` | `200000` | Max body characters indexed for full‑text search (`0` = no cap) |
-| `RPS_PREVIEW_CHARS` | `4000` | Body slice kept for the light re‑rank pass |
+| `RPS_FULLTEXT_CHARS` | `200000` | Body characters indexed for search (`0` = all); the rest is stored compressed for Collect |
+| `RPS_MAX_TEXT_CHARS` | `5000000` | Safety cap on text read from one PDF (`0` = none) |
 | `RPS_SEARCH_CANDIDATE_LIMIT` | `240` | Candidate rows re‑ranked per query |
 | `RPS_INDEX_COMMIT_BATCH` | `20` | Rows per DB commit while indexing |
 | `RPS_SQLITE_BUSY_MS` | `5000` | SQLite busy timeout (ms) |
@@ -135,7 +139,8 @@ as you would any other process output.
 
 ## How it works
 
-1. **Walk** the directory for `*.pdf` files.
+1. **Walk** the directory for `*.pdf` files, skipping macOS `._*` resource‑fork
+   files and recycle‑bin / system folders (`.Trashes`, `$RECYCLE.BIN`, …).
 2. **Extract** structured fields from the first few pages plus the **full body
    text** (in parallel worker processes). Text is normalised so it matches the
    way it reads: ligatures are expanded ("ﬁ" → "fi"), hyphen variants unified,
@@ -144,16 +149,19 @@ as you would any other process output.
    from the largest text on page 1; the year comes from the arXiv stamp,
    publication/copyright lines or proceedings headers before any other number.
 3. **Classify** each document: strong evidence (DOI, arXiv id, a References
-   heading) and supporting evidence (abstract, section headings, citations,
-   reputable publisher/venue/institution) are scored. Genuine papers/reports are
-   kept; the rest are hidden from results. PDFs with no extractable text
-   (scanned or damaged) are reported separately so they can be OCR'd, never
-   silently treated as "no match".
-4. **Store** them in SQLite; an FTS5 virtual table + triggers keep a whole‑document
-   full‑text index in sync. Only a short `preview` of the body is kept in the base
-   table for the re‑rank pass, so search stays fast.
-5. **Search** runs an FTS/BM25 candidate query over the whole document on a
-   background thread (typing never waits on the database). Papers containing
+   heading, or an official issuer/report type on the cover such as "Bank of
+   England Staff Working Paper" or "draft‑ietf‑…") and supporting evidence
+   (abstract, section headings, citations, reputable publisher/venue/institution)
+   are scored. Genuine papers/reports are kept; the rest are hidden from results
+   and listed under **Hidden…**, where you can override the decision. PDFs with no
+   extractable text (scanned or damaged) are reported separately so they can be
+   OCR'd, never silently treated as "no match".
+4. **Store** them in SQLite; an FTS5 virtual table + triggers keep the full‑text
+   index in sync. Small columns are stored before the large text so reading a
+   result never walks through a 200 KB body; text beyond `RPS_FULLTEXT_CHARS` is
+   kept zlib‑compressed for exact collection.
+5. **Search** ranks matches on the FTS index alone, then fetches only the best
+   rows, on a background thread (typing never waits on the database). Papers containing
    *all* query terms rank above papers containing only some; within each group,
    candidates are re‑ranked with word‑start and fuzzy matching on the short,
    high‑signal fields. Accented terms work as typed or without accents.
@@ -162,7 +170,8 @@ as you would any other process output.
 whole‑word/phrase regex decides matches (zero false positives), a paper must match
 *every* keyword, non‑papers are excluded, and content‑identical files already in
 the destination are skipped. Papers longer than `RPS_FULLTEXT_CHARS` are checked
-against their complete text, never just the indexed part. A copied paper that
+against their complete stored text, never just the indexed part, without
+re‑reading the PDF. A copied paper that
 shares a DOI/arXiv id with one already in the destination (e.g. a preprint and
 its published version) is copied but flagged for you to review.
 

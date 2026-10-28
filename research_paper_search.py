@@ -24,11 +24,13 @@ import queue
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 import tkinter as tk
 import unicodedata
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import suppress
 from pathlib import Path
@@ -113,11 +115,13 @@ def _default_index_dir() -> str:
 INDEX_DIR = os.environ.get("RPS_INDEX_DIR") or _default_index_dir()
 MAX_FRONT_PAGES = _env_int("RPS_MAX_FRONT_PAGES", 4)
 ABSTRACT_CHARS = _env_int("RPS_ABSTRACT_CHARS", 1200)
-# Full body text goes into the FTS index so the whole paper is searchable.
-# 0 means "no cap"; the default bounds pathological/huge PDFs.
+# The first FULLTEXT_CHARS characters of each paper go into the FTS index for
+# search; the rest is stored compressed so exact collection can check the whole
+# text without re-reading the PDF. 0 means "index everything".
 FULLTEXT_CHARS = _env_int("RPS_FULLTEXT_CHARS", 200000)
-# A short slice of the body kept in the base table for display/snippets only.
-PREVIEW_CHARS = _env_int("RPS_PREVIEW_CHARS", 4000)
+# Safety cap on text read from one PDF (0 = none). Longer documents are marked
+# truncated and re-read in full only when Collect has to check them.
+MAX_TEXT_CHARS = _env_int("RPS_MAX_TEXT_CHARS", 5000000)
 SEARCH_CANDIDATE_LIMIT = _env_int("RPS_SEARCH_CANDIDATE_LIMIT", 240)
 INDEX_COMMIT_BATCH = _env_int("RPS_INDEX_COMMIT_BATCH", 20)
 SQLITE_BUSY_MS = _env_int("RPS_SQLITE_BUSY_MS", 5000)
@@ -141,16 +145,14 @@ SCORE_WEIGHTS = {
     "keywords": 4.0,
     "abstract": 3.0,
     "authors": 2.0,
-    "preview": 1.0,
 }
 
 # Columns pulled into Python per candidate. `fulltext` is deliberately excluded
 # so large bodies never enter the hot search path (BM25 reads it in SQLite).
 RESULT_COLUMNS = (
     "id", "path", "filename", "title", "authors", "year",
-    "abstract", "keywords", "preview", "doi", "arxiv_id",
+    "abstract", "keywords", "doi", "arxiv_id",
 )
-_FTS_SELECT = ", ".join(f"papers.{col}" for col in RESULT_COLUMNS)
 _ROW_SELECT = ", ".join(RESULT_COLUMNS)
 
 # Fields the SQL fallback (no FTS5) substring-scans — includes the full body so
@@ -472,10 +474,40 @@ REPUTABLE_MARKERS = (
     "european commission", "national institutes of health", "research council",
     "national academies",
 )
+# Official issuers of reports and standards, and the report types they publish.
+# Named on a document's cover they are strong evidence of an institutional
+# report; mentioned anywhere else they only support other evidence. Generic
+# "central bank" is not here: it is a topic ("central bank digital currency").
+ISSUER_MARKERS = (
+    "bank for international settlements", "bis innovation hub",
+    "committee on payments and market infrastructures", "financial stability board",
+    "international monetary fund", "world bank", "oecd", "european central bank",
+    "eurosystem", "european commission", "european banking authority",
+    "european securities and markets authority", "federal reserve", "reserve bank",
+    "deutsche bundesbank", "bank of england", "bank of canada", "bank of japan",
+    "banque de france", "banca d'italia", "banco de españa", "swiss national bank",
+    "sveriges riksbank", "monetary authority of singapore", "hong kong monetary authority",
+    "people's bank of china", "world health organization", "nasa", "nist", "cern",
+    "unesco", "national academies", "national institutes of health",
+    # Bare "IETF" is a topic in networking slides; IETF documents identify
+    # themselves as an Internet-Draft / RFC (or "draft-ietf-..." below).
+    "internet engineering task force", "iso/iec", "w3c",
+    # report types
+    "consultation paper", "discussion paper", "working paper", "staff working paper",
+    "staff analytical paper", "staff discussion paper", "occasional paper", "policy paper",
+    "technical report", "economic bulletin", "monthly report", "special publication",
+    "internet-draft", "request for comments",
+)
 _REPUTABLE_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(marker) for marker in REPUTABLE_MARKERS) + r")\b",
+    r"\b(?:" + "|".join(re.escape(marker) for marker in (*REPUTABLE_MARKERS, *ISSUER_MARKERS)) + r")\b",
     re.IGNORECASE,
 )
+_ISSUER_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(marker) for marker in ISSUER_MARKERS) + r")\b|\bdraft-ietf-[a-z0-9-]+",
+    re.IGNORECASE,
+)
+# How much of page 1 counts as the cover: masthead, title block, issuer line.
+COVER_CHARS = 1500
 # A heading starts its own line, optionally numbered ("3", "3.1", "III.").
 _HEADING_PREFIX = r"^[ \t]*(?:(?:\d+(?:\.\d+)*|[IVX]+)\.?[ \t]+)?"
 _REFERENCES_HEADING_RE = re.compile(
@@ -508,8 +540,10 @@ def classify_document(fields: dict, raw_text: Optional[str] = None) -> tuple[boo
     Decide whether an extracted document is a genuine research paper or report.
 
     Strong evidence scores 2: a DOI, an arXiv id, a References/Bibliography
-    heading. Supporting evidence scores 1: an abstract, two or more standard
-    section headings, in-text citations, a reputable publisher/venue/institution.
+    heading, or an official issuer or report type named on the cover ("Bank of
+    England ... Discussion Paper", "draft-ietf-..."). Supporting evidence scores
+    1: an abstract, two or more standard section headings, in-text citations, a
+    reputable publisher/venue/institution named anywhere.
     A document needs ``SCHOLARLY_MIN_SCORE``. ``raw_text`` keeps line breaks, so a
     heading can be told apart from the same word in running prose ("payment
     methods" on an invoice is not a Methods section). Returns
@@ -531,6 +565,9 @@ def classify_document(fields: dict, raw_text: Optional[str] = None) -> tuple[boo
         add(2, "arXiv id")
     if _REFERENCES_HEADING_RE.search(raw_text):
         add(2, "references section")
+    issuer = _ISSUER_RE.search(raw_text[:COVER_CHARS])
+    if issuer:
+        add(2, f"issued by '{issuer.group(0).lower()}'")
     if fields.get("abstract"):
         add(1, "abstract")
     sections = {_section_key(name) for name in _SECTION_HEADING_RE.findall(raw_text)}
@@ -538,7 +575,7 @@ def classify_document(fields: dict, raw_text: Optional[str] = None) -> tuple[boo
         add(1, "sections: " + ", ".join(sorted(sections)))
     if len(_NUMERIC_CITATION_RE.findall(raw_text)) >= 5 or len(_ET_AL_RE.findall(raw_text)) >= 3:
         add(1, "citations")
-    marker = _REPUTABLE_RE.search(raw_text)
+    marker = None if issuer else _REPUTABLE_RE.search(raw_text)
     if marker:
         add(1, f"source '{marker.group(0).lower()}'")
 
@@ -550,14 +587,14 @@ def classify_document(fields: dict, raw_text: Optional[str] = None) -> tuple[boo
 def _extract_fields(pdf_path: str) -> dict[str, object]:
     """
     Extract structured fields from a research-paper PDF: title, authors, year,
-    abstract, keywords, fulltext (whole body, for the FTS index), preview (short
-    slice for display), doi, arxiv_id, plus the flags is_scholarly, has_text and
-    doc_reason.
+    abstract, keywords, fulltext (the first FULLTEXT_CHARS of the body, for the
+    FTS index), tail (the rest of the body, zlib-compressed), doi, arxiv_id, plus
+    the flags is_scholarly, has_text, truncated and doc_reason.
     """
     extracted = _extract_pdf_content(
         pdf_path,
         max_front_pages=MAX_FRONT_PAGES,
-        char_limit=FULLTEXT_CHARS,
+        char_limit=MAX_TEXT_CHARS,
     )
     if not extracted.front_pages:
         return {"is_scholarly": 0, "has_text": 0, "doc_reason": "unreadable PDF (could not be parsed)"}
@@ -578,14 +615,18 @@ def _extract_fields(pdf_path: str) -> dict[str, object]:
     doi_match = DOI_RE.search(combined_front)
     arxiv_match = ARXIV_RE.search(combined_front)
 
+    # Split exactly, so head + tail reproduces the whole cleaned text.
+    split = FULLTEXT_CHARS if FULLTEXT_CHARS > 0 else len(clean_body)
+    head, rest = clean_body[:split], clean_body[split:]
+
     fields: dict[str, object] = {
         "title": _clean(title)[:300],
         "authors": _clean(authors)[:300],
         "year": year,
         "abstract": _clean(abstract)[:ABSTRACT_CHARS],
         "keywords": _clean(keywords)[:400],
-        "fulltext": clean_body,
-        "preview": clean_body[:PREVIEW_CHARS],
+        "fulltext": head,
+        "tail": zlib.compress(rest.encode("utf-8")) if rest else None,
         # A DOI at the end of a sentence must not keep the full stop.
         "doi": doi_match.group(0).rstrip(".,;:)]}'\"")[:200] if doi_match else "",
         "arxiv_id": arxiv_match.group(1)[:50] if arxiv_match else "",
@@ -595,7 +636,10 @@ def _extract_fields(pdf_path: str) -> dict[str, object]:
         # Nothing to judge: report it as unreadable, not as a non-paper.
         fields.update(is_scholarly=0, has_text=0, doc_reason="no text layer (scanned image? needs OCR)")
     else:
-        is_scholarly, reason = classify_document(fields, raw_text=body)
+        # Judge on the same leading part of the text as before the full text was
+        # stored: headings deep inside a whole book are not evidence of a paper.
+        judged = body[:FULLTEXT_CHARS] if FULLTEXT_CHARS > 0 else body
+        is_scholarly, reason = classify_document(fields, raw_text=judged)
         fields.update(is_scholarly=int(is_scholarly), has_text=1, doc_reason=reason[:200])
     return fields
 
@@ -783,30 +827,38 @@ def _extract_block(text: str, head_re: re.Pattern, max_chars: int, max_lines: in
 # -----------------------------------------------------------------------------
 
 BASE_SCHEMA = """
+-- Small, frequently read columns come first and the large text last. SQLite
+-- stores a row's columns in order, so any column placed after a 200 KB body
+-- could only be read by walking that body's overflow pages.
 CREATE TABLE IF NOT EXISTS papers (
-    id          INTEGER PRIMARY KEY,
-    path        TEXT    UNIQUE NOT NULL,
-    mtime       REAL    NOT NULL,
-    size        INTEGER NOT NULL,
-    filename    TEXT    NOT NULL,
-    title       TEXT    DEFAULT '',
-    authors     TEXT    DEFAULT '',
-    year        TEXT    DEFAULT '',
-    abstract    TEXT    DEFAULT '',
-    keywords    TEXT    DEFAULT '',
-    fulltext    TEXT    DEFAULT '',   -- whole body; indexed by FTS for search
-    preview     TEXT    DEFAULT '',   -- short slice of the body; display only
-    doi         TEXT    DEFAULT '',
-    arxiv_id    TEXT    DEFAULT '',
-    is_scholarly INTEGER DEFAULT 1,   -- 1 = genuine paper/report, 0 = discarded
-    has_text    INTEGER DEFAULT 1,    -- 0 = no extractable text (scanned/damaged)
-    truncated   INTEGER DEFAULT 0,    -- 1 = fulltext hit RPS_FULLTEXT_CHARS; PDF has more
-    doc_reason  TEXT    DEFAULT '',   -- why it was (not) classified as scholarly
-    indexed_at  TEXT    DEFAULT (datetime('now'))
+    id           INTEGER PRIMARY KEY,
+    path         TEXT    UNIQUE NOT NULL,
+    mtime        REAL    NOT NULL,
+    size         INTEGER NOT NULL,
+    filename     TEXT    NOT NULL,
+    year         TEXT    DEFAULT '',
+    doi          TEXT    DEFAULT '',
+    arxiv_id     TEXT    DEFAULT '',
+    is_scholarly INTEGER DEFAULT 1,  -- classifier verdict: genuine paper/report?
+    visible      INTEGER DEFAULT 1,  -- shown in search/Collect: user override, else verdict
+    has_text     INTEGER DEFAULT 1,  -- 0 = no extractable text (scanned/damaged)
+    has_tail     INTEGER DEFAULT 0,  -- 1 = text beyond FULLTEXT_CHARS stored in tail
+    truncated    INTEGER DEFAULT 0,  -- 1 = text beyond MAX_TEXT_CHARS was not stored
+    doc_reason   TEXT    DEFAULT '', -- why it was (not) classified as scholarly
+    indexed_at   TEXT    DEFAULT (datetime('now')),
+    title        TEXT    DEFAULT '',
+    authors      TEXT    DEFAULT '',
+    keywords     TEXT    DEFAULT '',
+    abstract     TEXT    DEFAULT '',
+    fulltext     TEXT    DEFAULT '', -- first FULLTEXT_CHARS of the body; FTS-indexed
+    tail         BLOB                -- zlib-compressed rest of the body, or NULL
 );
--- path is already indexed by its UNIQUE constraint; only year needs its own
--- index (it is the sole structured filter used by search).
-CREATE INDEX IF NOT EXISTS idx_papers_year ON papers(year);
+-- The user's include/hide decisions, kept apart from papers so they survive a
+-- re-index or an index format upgrade.
+CREATE TABLE IF NOT EXISTS overrides (
+    path    TEXT PRIMARY KEY,
+    visible INTEGER NOT NULL
+);
 """
 
 FTS_SCHEMA = """
@@ -863,8 +915,10 @@ FTS5_AVAILABLE = _sqlite_has_fts5()
 # v3 added scholarly-document classification (is_scholarly / doc_reason).
 # v4 normalises extracted text (ligatures, hyphen variants, line-break hyphens).
 # v5 reads with pdfium, adds has_text, and improves title/year/classification.
-# v6 adds the FTS prefix index, the truncated flag, and better abstract bounds.
-INDEX_FORMAT_VERSION = 6
+# v6 adds the truncated flag and better abstract bounds.
+# v7 reorders columns (large text last), stores the full text (compressed tail),
+# adds user overrides, skips macOS/trash files, and recognises report issuers.
+INDEX_FORMAT_VERSION = 7
 
 
 def get_db_path(directory: str) -> str:
@@ -884,42 +938,21 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA cache_size=-32000")
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(BASE_SCHEMA)
-
-    # Add columns introduced after the original release (idempotent for old DBs).
-    existing = _table_columns(conn, "papers")
-    if "preview" not in existing:
-        conn.execute("ALTER TABLE papers ADD COLUMN preview TEXT DEFAULT ''")
-    if "is_scholarly" not in existing:
-        conn.execute("ALTER TABLE papers ADD COLUMN is_scholarly INTEGER DEFAULT 1")
-    if "doc_reason" not in existing:
-        conn.execute("ALTER TABLE papers ADD COLUMN doc_reason TEXT DEFAULT ''")
-    if "has_text" not in existing:
-        conn.execute("ALTER TABLE papers ADD COLUMN has_text INTEGER DEFAULT 1")
-    if "truncated" not in existing:
-        conn.execute("ALTER TABLE papers ADD COLUMN truncated INTEGER DEFAULT 0")
-
-    # One-time re-index when the extraction format changes. The FTS table is
-    # dropped too so its definition (e.g. the prefix index) is recreated current;
-    # triggers go first so clearing the rows does not touch the old FTS index.
+    # When the format changes the papers table is rebuilt (not just emptied), so
+    # its column layout is always current. The FTS table and triggers go first
+    # so dropping the rows does not touch the old FTS index. Overrides are kept.
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < INDEX_FORMAT_VERSION:
         if version:  # a brand-new database has nothing to re-index
-            LOGGER.info(
-                "Index format v%d -> v%d; clearing cache to re-index full text.",
-                version, INDEX_FORMAT_VERSION,
-            )
+            LOGGER.info("Index format v%d -> v%d; rebuilding the index.", version, INDEX_FORMAT_VERSION)
         for trigger in ("papers_ai", "papers_ad", "papers_au"):
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         with suppress(sqlite3.OperationalError):  # fts5 module may be missing
             conn.execute("DROP TABLE IF EXISTS papers_fts")
-        conn.execute("DELETE FROM papers")
+        conn.execute("DROP TABLE IF EXISTS papers")
         conn.execute(f"PRAGMA user_version = {INDEX_FORMAT_VERSION}")
+    conn.executescript(BASE_SCHEMA)
 
     if FTS5_AVAILABLE:
         fts_existed = conn.execute(
@@ -955,65 +988,71 @@ def open_reader(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+_UPSERT_COLUMNS = (
+    "path", "mtime", "size", "filename", "year", "doi", "arxiv_id", "is_scholarly", "visible",
+    "has_text", "has_tail", "truncated", "doc_reason", "title", "authors", "keywords",
+    "abstract", "fulltext", "tail",
+)
+_UPSERT_SQL = (
+    f"INSERT INTO papers ({', '.join(_UPSERT_COLUMNS)}, indexed_at) VALUES ("
+    + ", ".join(
+        # A user override wins over the classifier for what is visible.
+        "COALESCE((SELECT visible FROM overrides WHERE path = :path), :is_scholarly)"
+        if column == "visible" else f":{column}"
+        for column in _UPSERT_COLUMNS
+    )
+    + ", datetime('now')) ON CONFLICT(path) DO UPDATE SET "
+    + ", ".join(f"{column} = excluded.{column}" for column in (*_UPSERT_COLUMNS[1:], "indexed_at"))
+)
+
+
 def upsert_paper(
     conn: sqlite3.Connection,
     path: str,
     mtime: float,
     size: int,
-    fields: dict[str, str],
+    fields: dict,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO papers (path, mtime, size, filename, title, authors, year,
-                            abstract, keywords, fulltext, preview, doi, arxiv_id,
-                            is_scholarly, has_text, truncated, doc_reason, indexed_at)
-        VALUES (:path, :mtime, :size, :filename, :title, :authors, :year,
-                :abstract, :keywords, :fulltext, :preview, :doi, :arxiv_id,
-                :is_scholarly, :has_text, :truncated, :doc_reason, datetime('now'))
-        ON CONFLICT(path) DO UPDATE SET
-            mtime = excluded.mtime,
-            size = excluded.size,
-            filename = excluded.filename,
-            title = excluded.title,
-            authors = excluded.authors,
-            year = excluded.year,
-            abstract = excluded.abstract,
-            keywords = excluded.keywords,
-            fulltext = excluded.fulltext,
-            preview = excluded.preview,
-            doi = excluded.doi,
-            arxiv_id = excluded.arxiv_id,
-            is_scholarly = excluded.is_scholarly,
-            has_text = excluded.has_text,
-            truncated = excluded.truncated,
-            doc_reason = excluded.doc_reason,
-            indexed_at = excluded.indexed_at
-        """,
-        {
-            "path": path,
-            "mtime": mtime,
-            "size": size,
-            "filename": os.path.basename(path),
-            # Callers that seed rows directly (not via extraction) default to
-            # scholarly so they are not silently hidden from search.
-            "is_scholarly": int(fields.get("is_scholarly", 1)),
-            "has_text": int(fields.get("has_text", 1)),
-            "truncated": int(fields.get("truncated", 0)),
-            "doc_reason": str(fields.get("doc_reason", "")),
-            **{
-                key: fields.get(key, "")
-                for key in ("title", "authors", "year", "abstract", "keywords",
-                            "fulltext", "preview", "doi", "arxiv_id")
-            },
-        },
-    )
+    tail = fields.get("tail") or None
+    conn.execute(_UPSERT_SQL, {
+        "path": path,
+        "mtime": mtime,
+        "size": size,
+        "filename": os.path.basename(path),
+        # Callers that seed rows directly (not via extraction) default to
+        # scholarly so they are not silently hidden from search.
+        "is_scholarly": int(fields.get("is_scholarly", 1)),
+        "visible": None,  # computed in SQL
+        "has_text": int(fields.get("has_text", 1)),
+        "has_tail": int(tail is not None),
+        "truncated": int(fields.get("truncated", 0)),
+        "doc_reason": str(fields.get("doc_reason", "")),
+        "tail": tail,
+        **{key: fields.get(key, "") for key in
+           ("year", "doi", "arxiv_id", "title", "authors", "keywords", "abstract", "fulltext")},
+    })
+
+
+def set_visibility(conn: sqlite3.Connection, path: str, visible: bool) -> None:
+    """
+    Show or hide one document in search and Collect, overriding the classifier.
+    Choosing what the classifier decided anyway removes the override, so the
+    document follows the classifier again if it is re-indexed later.
+    """
+    row = conn.execute("SELECT is_scholarly FROM papers WHERE path = ?", (path,)).fetchone()
+    with conn:
+        if row is not None and bool(row[0]) == visible:
+            conn.execute("DELETE FROM overrides WHERE path = ?", (path,))
+        else:
+            conn.execute("INSERT OR REPLACE INTO overrides (path, visible) VALUES (?, ?)", (path, int(visible)))
+        conn.execute("UPDATE papers SET visible = ? WHERE path = ?", (int(visible), path))
 
 
 def count_nonscholarly(conn: sqlite3.Connection) -> int:
-    """How many readable documents were classified as non-papers (discarded)."""
+    """How many readable documents are hidden as non-papers."""
     try:
         return conn.execute(
-            "SELECT COUNT(*) FROM papers WHERE is_scholarly = 0 AND has_text = 1"
+            "SELECT COUNT(*) FROM papers WHERE visible = 0 AND has_text = 1"
         ).fetchone()[0]
     except sqlite3.Error:
         return 0
@@ -1027,11 +1066,35 @@ def count_textless(conn: sqlite3.Connection) -> int:
         return 0
 
 
+# Folders that never hold a user's papers: recycle bins, OS metadata, chkdsk
+# leftovers. Dot-folders (.Trashes, .Spotlight-V100, .git, ...) are skipped too.
+_SKIP_DIR_NAMES = {"$recycle.bin", "recycler", "system volume information", "lost+found"}
+_CHKDSK_DIR_RE = re.compile(r"^found\.\d{3}$", re.IGNORECASE)
+
+
+def _skip_directory(name: str, path: str) -> bool:
+    lowered = name.lower()
+    if lowered.startswith(".") or lowered in _SKIP_DIR_NAMES or _CHKDSK_DIR_RE.match(lowered):
+        return True
+    if sys.platform == "win32":  # hidden + system: Windows-managed folders
+        with suppress(OSError, AttributeError):
+            attributes = os.stat(path, follow_symlinks=False).st_file_attributes
+            wanted = stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM
+            return attributes & wanted == wanted
+    return False
+
+
 def iter_pdf_files(directory: str) -> list[Path]:
+    """
+    Every PDF under ``directory``, skipping recycle bins and OS folders, and
+    macOS "._name.pdf" files: those are 4 KB resource-fork companions written on
+    non-Mac drives, not PDFs, and would otherwise be reported as unreadable.
+    """
     pdf_paths: list[Path] = []
-    for root, _, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [name for name in dirs if not _skip_directory(name, os.path.join(root, name))]
         for name in files:
-            if name.lower().endswith(".pdf"):
+            if name.lower().endswith(".pdf") and not name.startswith("._"):
                 pdf_paths.append(Path(root) / name)
     pdf_paths.sort(key=lambda path: str(path).lower())
     return pdf_paths
@@ -1259,6 +1322,36 @@ def parse_year_range(raw: Optional[str]) -> Optional[tuple[int, int]]:
     return (low, high) if low <= high else (high, low)
 
 
+# One weight per FTS column, in declared order: title, authors, year, abstract,
+# keywords, fulltext.
+_BM25 = "bm25(papers_fts, 5.0, 2.0, 1.0, 3.0, 4.0, 1.0)"
+_ID_CHUNK = 400  # ids per "WHERE id IN (...)" lookup
+
+
+def _ranked_rows(conn, match: str, filters: str, params: list, need: int, exclude: set) -> list:
+    """
+    Up to ``need`` rows matching ``match``, best first. Ranking runs on the FTS
+    index alone (cheap); full rows are then fetched for the best ids only, in
+    chunks, until enough pass the filters. Joining every match before sorting
+    read thousands of rows per keystroke on a common word.
+    """
+    ids = [rowid for (rowid,) in conn.execute(
+        f"SELECT rowid FROM papers_fts WHERE papers_fts MATCH ? ORDER BY {_BM25}", [match]
+    ) if rowid not in exclude]
+    rows: list = []
+    for start in range(0, len(ids), _ID_CHUNK):
+        chunk = ids[start:start + _ID_CHUNK]
+        found = conn.execute(
+            f"SELECT {_ROW_SELECT} FROM papers WHERE id IN ({','.join('?' * len(chunk))}){filters}",
+            [*chunk, *params],
+        ).fetchall()
+        position = {rowid: index for index, rowid in enumerate(chunk)}
+        rows.extend(sorted(found, key=lambda row: position[row["id"]]))
+        if len(rows) >= need:
+            break
+    return rows[:need]
+
+
 def _fetch_candidate_rows(
     conn: sqlite3.Connection,
     terms: list[str],
@@ -1267,65 +1360,44 @@ def _fetch_candidate_rows(
 ) -> tuple[list[sqlite3.Row], int]:
     """Candidates best-first, plus how many leading rows contain every term."""
     limit = max(SEARCH_CANDIDATE_LIMIT, top_n * 10)
+    filters, params = "", []
+    if year_range:
+        filters += " AND CAST(year AS INTEGER) BETWEEN ? AND ?"
+        params.extend(year_range)
+    if REQUIRE_SCHOLARLY:
+        filters += " AND visible = 1"
 
     if FTS5_AVAILABLE:
         tokens = _fts_tokens(terms)
         if tokens:
-            sql = f"""
-                SELECT {_FTS_SELECT}
-                FROM papers_fts
-                JOIN papers ON papers.id = papers_fts.rowid
-                WHERE papers_fts MATCH ?
-            """
-            filters: list[object] = []
-            if year_range:
-                sql += " AND CAST(papers.year AS INTEGER) BETWEEN ? AND ?"
-                filters.extend(year_range)
-            if REQUIRE_SCHOLARLY:
-                sql += " AND papers.is_scholarly = 1"
-            # One weight per FTS column, in declared order:
-            # title, authors, year, abstract, keywords, fulltext.
-            sql += " ORDER BY bm25(papers_fts, 5.0, 2.0, 1.0, 3.0, 4.0, 1.0) LIMIT ?"
             try:
-                # Papers containing ALL terms come first (fewer candidates, so
-                # faster and more relevant); papers with ANY term only fill up
-                # the list when there are not enough full matches. The FTS
-                # answer is final, empty or not: falling back to a substring
-                # scan on "no results" read the whole library's text.
-                rows = conn.execute(sql, [" AND ".join(tokens), *filters, limit]).fetchall()
+                # Papers containing ALL terms come first; papers with ANY term
+                # only fill up the list when there are not enough full matches.
+                # The FTS answer is final, empty or not: falling back to a
+                # substring scan on "no results" read the whole library's text.
+                rows = _ranked_rows(conn, " AND ".join(tokens), filters, params, limit, set())
                 full_matches = len(rows)
                 if full_matches < top_n and len(tokens) > 1:
                     seen = {row["id"] for row in rows}
-                    more = conn.execute(sql, [" OR ".join(tokens), *filters, limit]).fetchall()
-                    rows += [row for row in more if row["id"] not in seen]
-                return rows[:limit], min(full_matches, limit)
+                    rows += _ranked_rows(conn, " OR ".join(tokens), filters, params, limit - full_matches, seen)
+                return rows, full_matches
             except sqlite3.OperationalError:
                 LOGGER.warning("FTS query failed; falling back to SQL scan.", exc_info=True)
-
-    where_clauses: list[str] = []
-    params: list[object] = []
-    if year_range:
-        where_clauses.append("CAST(year AS INTEGER) BETWEEN ? AND ?")
-        params.extend(year_range)
-    if REQUIRE_SCHOLARLY:
-        where_clauses.append("is_scholarly = 1")
 
     term_clauses: list[str] = []
     for term in terms:
         field_checks = [f"instr(lower({field}), ?) > 0" for field in SEARCH_FIELDS]
         term_clauses.append("(" + " OR ".join(field_checks) + ")")
         params.extend([term] * len(SEARCH_FIELDS))
-
+    sql = f"SELECT {_ROW_SELECT} FROM papers WHERE 1{filters}"
     if term_clauses:
-        where_clauses.append("(" + " OR ".join(term_clauses) + ")")
-
-    sql = f"SELECT {_ROW_SELECT} FROM papers"
-    if where_clauses:
-        sql += " WHERE " + " AND ".join(where_clauses)
-    sql += " LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
+        sql += " AND (" + " OR ".join(term_clauses) + ")"
+    rows = conn.execute(sql + " LIMIT ?", [*params, limit]).fetchall()
     return rows, len(rows)
+
+
+# Unicode combining marks (accents), removed after NFKD decomposition.
+_COMBINING_RE = re.compile("[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]")
 
 
 def _fold(text: str) -> str:
@@ -1333,7 +1405,7 @@ def _fold(text: str) -> str:
     text = text.lower()
     if text.isascii():
         return text
-    return "".join(char for char in unicodedata.normalize("NFKD", text) if not unicodedata.combining(char))
+    return _COMBINING_RE.sub("", unicodedata.normalize("NFKD", text))
 
 
 @functools.lru_cache(maxsize=256)
@@ -1530,17 +1602,17 @@ def paper_matches(row, patterns: list[re.Pattern]) -> bool:
 
 _CANDIDATE_COLUMNS = ", ".join(
     f"papers.{column}"
-    for column in (*MATCH_FIELDS, "id", "path", "is_scholarly", "truncated", "doi", "arxiv_id")
+    for column in ("id", "path", "visible", "has_tail", "truncated", "doi", "arxiv_id", *MATCH_FIELDS)
 )
 
 
 def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlite3.Row]:
     """
     Narrow to papers that plausibly contain all keywords. FTS does this fast over
-    huge collections; the caller still verifies each hit exactly. Papers whose
-    stored text was cut at RPS_FULLTEXT_CHARS are always included, because a
-    keyword beyond the cut is invisible to FTS. Falls back to a full scan when
-    FTS5 is unavailable (correctness is unaffected either way).
+    huge collections; the caller still verifies each hit exactly. Papers longer
+    than the FTS-indexed part are always included, because a keyword beyond it
+    is invisible to FTS. Falls back to a full scan when FTS5 is unavailable
+    (correctness is unaffected either way).
     """
     rows = None
     if FTS5_AVAILABLE:
@@ -1561,16 +1633,25 @@ def _candidate_rows(conn: sqlite3.Connection, keywords: list[str]) -> list[sqlit
     if rows is None:
         return conn.execute(f"SELECT {_CANDIDATE_COLUMNS} FROM papers").fetchall()
     seen = {row["id"] for row in rows}
-    truncated = conn.execute(f"SELECT {_CANDIDATE_COLUMNS} FROM papers WHERE truncated = 1")
-    return rows + [row for row in truncated if row["id"] not in seen]
+    longer = conn.execute(f"SELECT {_CANDIDATE_COLUMNS} FROM papers WHERE has_tail = 1 OR truncated = 1")
+    return rows + [row for row in longer if row["id"] not in seen]
 
 
-def _with_full_text(row) -> dict:
-    """The row with ``fulltext`` replaced by the PDF's complete, uncapped text."""
+def _complete_text_row(conn: sqlite3.Connection, row) -> dict:
+    """
+    The row with ``fulltext`` extended to the whole document: the stored,
+    compressed tail is appended (no PDF access). Only a document longer than
+    MAX_TEXT_CHARS, whose stored text is itself incomplete, is re-read.
+    """
     full = dict(row)
-    extracted = _extract_pdf_content(row["path"], max_front_pages=1, char_limit=0)
-    if extracted.body:
-        full["fulltext"] = _clean(extracted.body)
+    if row["truncated"]:
+        extracted = _extract_pdf_content(row["path"], max_front_pages=1, char_limit=0)
+        if extracted.body:
+            full["fulltext"] = _clean(extracted.body)
+        return full
+    (tail,) = conn.execute("SELECT tail FROM papers WHERE id = ?", (row["id"],)).fetchone()
+    if tail:
+        full["fulltext"] = row["fulltext"] + zlib.decompress(tail).decode("utf-8")
     return full
 
 
@@ -1734,11 +1815,16 @@ def aggregate_matches(
             # Never re-collect files already sitting in the destination folder.
             if os.path.abspath(path).startswith(dest_prefix):
                 continue
-            checked = _with_full_text(row) if row["truncated"] else row
-            if paper_matches(checked, patterns):
+            # The FTS-indexed text decides most papers; the rest of a long paper
+            # is only decompressed when that part alone does not match.
+            hit = paper_matches(row, patterns) or (
+                bool(row["has_tail"] or row["truncated"])
+                and paper_matches(_complete_text_row(conn, row), patterns)
+            )
+            if hit:
                 # Only genuine papers/reports are collected; the rest are counted
                 # so the user can be told they were excluded.
-                if REQUIRE_SCHOLARLY and not row["is_scholarly"]:
+                if REQUIRE_SCHOLARLY and not row["visible"]:
                     skipped_nonpaper += 1
                 else:
                     matched.append((path, row["doi"] or "", row["arxiv_id"] or ""))
@@ -1881,7 +1967,7 @@ class ScrollableFrame(tk.Frame):
 class ResultCard(tk.Frame):
     """A single result card widget."""
 
-    def __init__(self, parent, result: dict, on_open, on_reveal, **kwargs):
+    def __init__(self, parent, result: dict, on_open, on_reveal, on_hide=None, **kwargs):
         super().__init__(
             parent,
             bg=THEME["card"],
@@ -1893,10 +1979,32 @@ class ResultCard(tk.Frame):
         self.result = result
         self.on_open = on_open
         self.on_reveal = on_reveal
+        self.on_hide = on_hide
         self._build(result)
         self.bind("<Enter>", self._hover_on, add="+")
         self.bind("<Leave>", self._hover_off, add="+")
         self.bind("<Double-Button-1>", lambda _event: on_open(result["path"]), add="+")
+        # Right-click (Ctrl-click / two-finger click on macOS) anywhere on the card.
+        for sequence in ("<Button-3>", "<Button-2>") if sys.platform == "darwin" else ("<Button-3>",):
+            self._bind_all_descendants(self, sequence, self._show_menu)
+
+    def _bind_all_descendants(self, widget: tk.Widget, sequence: str, handler) -> None:
+        widget.bind(sequence, handler, add="+")
+        for child in widget.winfo_children():
+            self._bind_all_descendants(child, sequence, handler)
+
+    def _show_menu(self, event) -> None:
+        path = self.result["path"]
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Open PDF", command=lambda: self.on_open(path))
+        menu.add_command(label="Reveal in file manager", command=lambda: self.on_reveal(path))
+        if self.on_hide:
+            menu.add_separator()
+            menu.add_command(label="Hide from results (not a paper/report)", command=lambda: self.on_hide(path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _build(self, result: dict) -> None:
         top = tk.Frame(self, bg=THEME["card"])
@@ -2328,6 +2436,134 @@ class CollectDialog(tk.Toplevel):
         self.destroy()
 
 
+class HiddenDocsDialog(tk.Toplevel):
+    """
+    Lists PDFs that search and Collect leave out (not judged a paper/report, or
+    no extractable text), with the reason, and lets the user override the
+    classifier per document. Overrides survive re-indexing.
+    """
+
+    STATUS_AUTO = "Hidden: not a paper/report"
+    STATUS_TEXTLESS = "No text (scanned/damaged)"
+    STATUS_INCLUDED = "Included by you"
+    STATUS_HIDDEN = "Hidden by you"
+
+    def __init__(self, parent: "App", db_path: str, on_change: Callable[[], None]):
+        super().__init__(parent)
+        self.title("Hidden documents")
+        self.configure(bg=THEME["bg"], padx=14, pady=12)
+        self.geometry("900x480")
+        self.minsize(640, 320)
+        self.transient(parent)
+        self._conn = open_db(db_path)
+        self._on_change = on_change
+        self._rows: dict[str, sqlite3.Row] = {}
+        self._build()
+        self._refresh()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _e: self._close(), add="+")
+
+    def _build(self) -> None:
+        tk.Label(
+            self,
+            text="These PDFs are left out of search and Collect. If one is a genuine paper "
+                 "or report, select it and choose Include.",
+            bg=THEME["bg"], fg=THEME["subtext"], font=THEME["font_small"],
+            anchor="w", justify="left", wraplength=860,
+        ).pack(fill="x", pady=(0, 8))
+
+        frame = tk.Frame(self, bg=THEME["bg"])
+        frame.pack(fill="both", expand=True)
+        self._tree = ttk.Treeview(frame, columns=("status", "file", "reason"), show="headings",
+                                  selectmode="extended")
+        for column, label, width in (("status", "Status", 190), ("file", "File", 330), ("reason", "Why", 330)):
+            self._tree.heading(column, text=label)
+            self._tree.column(column, width=width, anchor="w")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self._tree.pack(side="left", fill="both", expand=True)
+        self._tree.bind("<Double-1>", lambda _e: self._open_selected(), add="+")
+
+        buttons = tk.Frame(self, bg=THEME["bg"])
+        buttons.pack(fill="x", pady=(10, 0))
+        self._count = tk.Label(buttons, text="", bg=THEME["bg"], fg=THEME["subtext"], font=THEME["font_small"])
+        self._count.pack(side="left")
+        for text, command, primary in (("Close", self._close, False),
+                                       ("Hide", lambda: self._set_selected(False), False),
+                                       ("Include in search", lambda: self._set_selected(True), True),
+                                       ("Open PDF", self._open_selected, False)):
+            tk.Button(
+                buttons, text=text, command=command, bd=0, padx=12, pady=5, cursor="hand2",
+                font=THEME["font_small"],
+                bg=THEME["accent"] if primary else THEME["surface"],
+                fg="white" if primary else THEME["subtext"],
+                activebackground="#B85E31" if primary else THEME["accent_soft"],
+            ).pack(side="right", padx=(6, 0))
+
+    def _status(self, row) -> str:
+        if not row["has_text"]:
+            return self.STATUS_TEXTLESS
+        if row["override"] is not None:
+            return self.STATUS_INCLUDED if row["visible"] else self.STATUS_HIDDEN
+        return self.STATUS_AUTO
+
+    def _refresh(self) -> None:
+        rows = self._conn.execute(
+            "SELECT p.path, p.filename, p.doc_reason, p.has_text, p.visible, o.visible AS override "
+            "FROM papers p LEFT JOIN overrides o ON o.path = p.path "
+            "WHERE p.visible = 0 OR o.path IS NOT NULL "
+            "ORDER BY p.has_text DESC, p.visible, p.filename COLLATE NOCASE"
+        ).fetchall()
+        self._tree.delete(*self._tree.get_children())
+        self._rows = {}
+        for row in rows:
+            self._rows[row["path"]] = row
+            self._tree.insert("", "end", iid=row["path"],
+                              values=(self._status(row), row["filename"], row["doc_reason"]))
+        hidden = sum(1 for row in rows if not row["visible"])
+        self._count.configure(text=f"{hidden} hidden · {len(rows) - hidden} included by you")
+
+    def _selected(self) -> list:
+        return [self._rows[iid] for iid in self._tree.selection() if iid in self._rows]
+
+    def _set_selected(self, visible: bool) -> None:
+        rows = self._selected()
+        if not rows:
+            return
+        textless = [row for row in rows if not row["has_text"]]
+        if visible and textless:
+            messagebox.showinfo(
+                "No text",
+                f"{len(textless)} selected PDF(s) have no extractable text (scanned or damaged), "
+                "so they cannot be searched. Run OCR on them first.",
+                parent=self,
+            )
+        changed = False
+        for row in rows:
+            if row["has_text"] and bool(row["visible"]) != visible:
+                set_visibility(self._conn, row["path"], visible)
+                changed = True
+        if changed:
+            self._refresh()
+            self._on_change()
+
+    def _open_selected(self) -> None:
+        for row in self._selected()[:5]:
+            with suppress(Exception):
+                if sys.platform == "win32":
+                    os.startfile(row["path"])
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", row["path"]])
+                else:
+                    subprocess.Popen(["xdg-open", row["path"]])
+
+    def _close(self) -> None:
+        with suppress(sqlite3.Error):
+            self._conn.close()
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2487,8 +2723,25 @@ class App(tk.Tk):
             activeforeground="white",
             command=self._open_collect_dialog,
         )
-        collect_btn.pack(side="left", padx=(0, 14))
+        collect_btn.pack(side="left", padx=(0, 6))
         Tooltip(collect_btn, "Copy papers that exactly contain ALL keywords to a folder")
+
+        hidden_btn = tk.Button(
+            dir_bar,
+            text="Hidden…",
+            bg=THEME["surface"],
+            fg=THEME["subtext"],
+            font=THEME["font_small"],
+            bd=0,
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            activebackground=THEME["accent_soft"],
+            activeforeground=THEME["text"],
+            command=self._open_hidden_dialog,
+        )
+        hidden_btn.pack(side="left", padx=(0, 14))
+        Tooltip(hidden_btn, "PDFs not shown in results (non-papers, scanned files) — review and include")
 
         self._progress = ttk.Progressbar(self, mode="indeterminate", style="TProgressbar")
 
@@ -2662,6 +2915,28 @@ class App(tk.Tk):
             return
         self._start_indexing(self._directory, self._db_path, force_reindex=True)
 
+    def _open_hidden_dialog(self) -> None:
+        if not self._db_path:
+            messagebox.showinfo("No directory", "Please select a directory first.")
+            return
+        dialog = HiddenDocsDialog(self, self._db_path, on_change=self._on_visibility_change)
+        dialog.focus_set()
+
+    def _on_visibility_change(self) -> None:
+        if self._last_query:
+            self._do_search()
+
+    def _hide_result(self, path: str) -> None:
+        if not self._search_conn:
+            return
+        try:
+            set_visibility(self._search_conn, path, False)
+        except sqlite3.Error as exc:
+            messagebox.showerror("Hide", f"Could not hide the document:\n{exc}")
+            return
+        self._set_status(f"Hidden: {os.path.basename(path)} — undo under Hidden…", color=THEME["highlight"])
+        self._on_visibility_change()
+
     def _open_collect_dialog(self) -> None:
         dialog = CollectDialog(self, source_default=self._directory)
         dialog.focus_set()
@@ -2735,7 +3010,7 @@ class App(tk.Tk):
                     discarded = count_nonscholarly(self._search_conn)
             notes = []
             if discarded:
-                notes.append(f"{discarded} non-paper doc(s) hidden")
+                notes.append(f"{discarded} non-paper doc(s) hidden (see Hidden…)")
             if textless:
                 notes.append(f"{textless} without text (scanned/damaged)")
             if notes:
@@ -2848,6 +3123,7 @@ class App(tk.Tk):
                 results[index],
                 on_open=self._open_pdf,
                 on_reveal=self._reveal_in_explorer,
+                on_hide=self._hide_result,
             )
             card.pack(fill="x", padx=8, pady=4)
         if end < len(results):

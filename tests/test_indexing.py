@@ -43,8 +43,9 @@ def test_legacy_database_is_migrated_and_reindexed(tmp_path):
     legacy.close()
 
     conn = rps.open_db(db)
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(papers)")}
-    assert {"preview", "is_scholarly", "has_text", "truncated"} <= columns
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(papers)")]
+    assert {"is_scholarly", "visible", "has_text", "has_tail", "truncated"} <= set(columns)
+    assert columns[-2:] == ["fulltext", "tail"], "large text must be stored last"
     assert conn.execute("PRAGMA user_version").fetchone()[0] == rps.INDEX_FORMAT_VERSION
     assert conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 0
     rps.upsert_paper(conn, "y.pdf", 1, 1, {"title": "Fresh paper"})
@@ -74,3 +75,37 @@ def test_write_lock_not_held_while_extracting(tmp_path, monkeypatch):
     finally:
         other.close()
         indexer.join()
+
+
+def test_macos_and_system_junk_is_skipped(tmp_path):
+    make_pdf(tmp_path / "paper.pdf", [paper_page()])
+    (tmp_path / "._paper.pdf").write_bytes(b"\x00\x05\x16\x07" + b"\x00" * 4092)  # AppleDouble
+    for folder in (".Trashes", ".TemporaryItems", "$RECYCLE.BIN", "FOUND.000", "System Volume Information"):
+        (tmp_path / folder).mkdir()
+        make_pdf(tmp_path / folder / "deleted.pdf", [paper_page()])
+    (tmp_path / "sub").mkdir()
+    make_pdf(tmp_path / "sub" / "kept.pdf", [paper_page()])
+    names = sorted(path.name for path in rps.iter_pdf_files(str(tmp_path)))
+    assert names == ["kept.pdf", "paper.pdf"]
+
+
+def test_overrides_survive_reindexing(tmp_path):
+    folder = tmp_path / "lib"
+    folder.mkdir()
+    make_pdf(folder / "slides.pdf", [[(10, f"Slide {i}: notes about zeolitex catalysts.") for i in range(30)]])
+    db = rps.get_db_path(str(folder))
+    rps.index_directory(str(folder), db, workers=1)
+    conn = rps.open_db(db)
+    path = str(folder / "slides.pdf")
+    assert conn.execute("SELECT visible FROM papers").fetchone()[0] == 0
+    assert rps.search(conn, "zeolitex") == []
+
+    rps.set_visibility(conn, path, True)
+    assert [r["filename"] for r in rps.search(conn, "zeolitex")] == ["slides.pdf"]
+    rps.index_directory(str(folder), db, workers=1, force_reindex=True)   # rows rebuilt
+    assert [r["filename"] for r in rps.search(conn, "zeolitex")] == ["slides.pdf"]
+
+    rps.set_visibility(conn, path, False)   # back to the classifier's verdict
+    assert conn.execute("SELECT COUNT(*) FROM overrides").fetchone()[0] == 0
+    assert rps.search(conn, "zeolitex") == []
+    conn.close()

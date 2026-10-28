@@ -84,3 +84,20 @@ def test_copy_hashes_only_on_size_collision(tmp_path, monkeypatch):
     copied, errors, skipped = rps._copy_into([str(a), str(b), str(c)], str(dest))
     assert [name for _, name in copied] == ["a.pdf", "b.pdf"] and skipped == 1 and errors == 0
     assert str(b) not in hashed                          # unique size: never hashed
+
+
+def test_collect_never_rereads_pdfs_for_long_papers(tmp_path, monkeypatch):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    src.mkdir()
+    pages = paper("Long Report on Materials", "Short abstract.")
+    pages += [[(10, f"Filler line {i} on page {p} about materials.") for i in range(45)] for p in range(5)]
+    pages += [[(10, "The rare term hafniumx appears only at the very end.")]]
+    make_pdf(src / "long.pdf", pages)
+    monkeypatch.setattr(rps, "FULLTEXT_CHARS", 3000)
+    rps.index_directory(str(src), rps.get_db_path(str(src)), workers=1)
+
+    def no_pdf_access(*_args, **_kwargs):
+        raise AssertionError("Collect re-read a PDF")
+    monkeypatch.setattr(rps, "_extract_pdf_content", no_pdf_access)
+    stats = rps.aggregate_matches(str(src), str(dest), ["hafniumx", "materials"], workers=1)
+    assert stats.copied == 1, stats
